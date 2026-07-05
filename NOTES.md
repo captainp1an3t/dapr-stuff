@@ -335,3 +335,48 @@ Every one of those 60 events had a line-item ID whose `processed:<id>` marker wa
 - Rolling deploys don't cause double-processing
 
 Getting this property "for free" from `FirstWrite` on a Dapr state store is genuinely a nice piece of the pitch.
+
+---
+
+## T9 — Anomaly detection: event-driven + batch, idempotent
+
+_2026-07-04_
+
+Pure `Detect(current, history, cfg, now) → *Anomaly` in shared/finops; rollup-svc wires it into two triggers (per-event on rollup update, and `POST /detect?day=...` batch). Anomalies dedupe via `FirstWrite` on `anomaly:<day>:<team>:<service>` and publish to `anomaly.detected` on RabbitMQ. Verified end-to-end with a Python `--spike` flag that injects a 4× cost multiplier on `cc-payments-001/ec2`.
+
+### Pros
+
+- **Pure `Detect` in the shared package.** 7 test cases: happy path, at-threshold, below-threshold, below-floor, empty history, zero-cost, mixed-value history. Sub-second, no Dapr, no I/O. Same pattern as `Enrich` and `Rollup.Merge` — the Dapr adapter is a thin wrapper.
+- **Two triggers, one detection function.** Event-driven detection fires as soon as a rollup crosses the threshold (near-real-time). Batch (`POST /detect?day=...`) scans the whole (team × service) grid for a day — useful for backtesting, deterministic verification, and cron-driven end-of-day passes. Both call the same `runDetection` code path.
+- **Anomaly ID is deterministic** (`anomaly:<day>:<team>:<service>`) so FirstWrite gives us exactly-once semantics across triggers. Verified: cleared markers, batch detected 10 anomalies (`detected: 10`); ran again immediately, all 10 came back as `duplicate: 10`. Same pattern as line-item idempotency in T8 — this repo now has three layers of dedupe (processed-lines, rollup ETag, detected-anomalies), all using the same Dapr primitive.
+- **Tunable via env vars** (`ANOMALY_PCT_THRESHOLD`, `ANOMALY_MIN_BASELINE_USD`, `ANOMALY_BASELINE_DAYS`) so a demo can walk through sensitivity settings without redeploying.
+- **The `--spike CC:SVC:MULT` generator flag proved anomaly injection is deterministic.** `make anomaly-demo` runs backfill → 4× spike → batch detect and reliably surfaces the seeded anomaly as a top hit (877% over baseline in our run).
+
+### Cons / Gotchas
+
+- **Cross-app state access is impossible under Dapr's default `keyPrefix: appid`.** rollup-svc originally tried to read cost-center reference data from `state-redis` — the same store ingest-svc seeded. Every call returned nothing. Cause: Dapr auto-prefixes keys with the calling app-id. ingest-svc writes `ingest-svc||cost-center:cc-payments-001`; rollup-svc reads `rollup-svc||cost-center:cc-payments-001`. Different keyspaces, no overlap. **Options to share reference data across services:**
+  1. Set `keyPrefix: none` on the Component — everyone shares one keyspace, isolation is gone
+  2. Set `keyPrefix: <fixed-app-id>` — all services see one specific app-id's keyspace (better than none, still opinionated)
+  3. Use a **separate** Component just for shared data (e.g., `state-shared`) with `keyPrefix: none`
+  4. Mount the reference data via ConfigMap — bypass Dapr entirely for boot-time constants
+  5. Service invocation: ask the owning service (`GET ingest-svc/lookups/...`) — always correct but a live-hop per read
+  
+  We chose #4 (ConfigMap) because the cost-center map is boot-time constant reference data, not a live database. Both ingest-svc and rollup-svc mount the same `cost-center-seed` ConfigMap; the JSON file is the source of truth. Nothing about Dapr changes; it's just not the right tool for this specific job. **This is a real Dapr abstraction limit worth calling out**: state stores are per-app by design, and the abstraction cannot pretend otherwise without giving up isolation.
+- **Batch detect enumerates a hardcoded service list.** `knownServices = []string{"ec2","s3","rds","lambda","cloudfront"}` in rollup-svc must stay in sync with the generator's `SERVICES` list. Adding a new service means editing both. A more elegant solution would be discovering active `(team, service)` pairs from actual state keys — `QueryStateAlpha1` on postgres v2 supports this — but that's a T-something optimization, not T9. Noted.
+- **RabbitMQ auto-provisions the `anomaly.detected` exchange on first publish, even with no subscribers.** Verified via `rabbitmqctl list_exchanges | grep anomaly` → the fanout exchange exists. Messages currently drop (no bound queues) — that changes when triage-svc arrives in T11. Not a bug; Dapr / RabbitMQ default behaviour. But if someone forgot to deploy the subscriber and expected retention, they'd be sad.
+- **The event-driven trigger fires on EVERY rollup update**, not just once per (team, service, day). For a 100-line-item ingest with 4-5 items per (team, service), that's ~4-5 detection attempts per key, most producing zero new anomalies (only the last item might tip the total over threshold). Cheap in absolute terms — a GET on the day's rollup + 7 GETs for history = 8 state ops per event × ~100 events = 800 state calls per batch. Fine for the demo scale. In real FinOps we'd throttle to end-of-day + on-demand only.
+- **Injected anomaly showed 877% over baseline, not the expected ~400% from a 4x multiplier.** Because the multiplier applies per-line-item, not per-rollup, and only to items whose `cost-center` tag AND `service` both match. Random sampling means the number of matching items varies day-to-day, so the aggregate delta isn't cleanly 4×. Not a bug — real FinOps anomalies have similar heterogeneity — but worth noting for anyone reading the demo output.
+- **The `$10` `MinBaselineUSD` floor is a demo value, not a production one.** At real FinOps scale a static global floor is the wrong tool — sensible values differ by orders of magnitude across services (`analytics/rds` vs. `identity/lambda`). Production would want per-team or per-service floors, or something budget-driven ("alert at 80% of the daily budget"), or seasonal baselines (weekday vs. weekend). It's tunable at runtime via `ANOMALY_MIN_BASELINE_USD` on rollup-svc, so at least you can experiment without a redeploy — but the shape of the config, not just the value, is a demo simplification that would evolve.
+
+### Overhead
+
+- No new pods (detection lives inside rollup-svc). rollup-svc memory rose slightly (~5 MiB) from the ConfigMap read + detection logic. No new sidecar cost. Cluster total unchanged from T8.
+
+### Meta
+
+- 3 idempotency mechanisms now, all via `FirstWrite` on Dapr state:
+  1. `processed:<line-item-id>` — no rollup double-count on message redelivery
+  2. Rollup upsert with ETag — no lost updates under concurrent handlers
+  3. `anomaly:<day>:<team>:<service>` — no duplicate anomaly publish across trigger types
+  Each is ~5 lines of Go. **Dapr state's concurrency options are the single most valuable feature we've exercised for correctness so far.**
+- Ready for T10 (Grafana dashboard on the rollups) and T11 (triage-svc subscribing to `anomaly.detected` and driving a workflow).

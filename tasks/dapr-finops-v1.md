@@ -193,7 +193,7 @@ TDD focus: the aggregation function is pure — given a rollup and an incoming e
 
 ---
 
-## - [ ] T9: Anomaly detection
+## - [x] T9: Anomaly detection
 
 **Type**: HITL — threshold, baseline window, and anomaly-per-dimension are real decisions
 **Blocked by**: T8
@@ -206,11 +206,11 @@ TDD focus: the baseline + threshold logic is pure math — cover exhaustively. I
 
 ### Acceptance criteria
 
-- [ ] Baseline formula and threshold are decided together and written in a short comment on the detection function
-- [ ] Anomaly event is published with enough context to notify (team, service, day, baseline, actual, delta)
-- [ ] Non-anomalous days do **not** produce events
-- [ ] Unit tests cover the boundary conditions of the threshold
-- [ ] `NOTES.md`: any Dapr-specific concerns with running detection on every event vs. on a schedule
+- [x] Baseline formula and threshold are decided together and written in a short comment on the detection function
+- [x] Anomaly event is published with enough context to notify (team, service, day, baseline, actual, delta)
+- [x] Non-anomalous days do **not** produce events
+- [x] Unit tests cover the boundary conditions of the threshold
+- [x] `NOTES.md`: any Dapr-specific concerns with running detection on every event vs. on a schedule
 
 ---
 

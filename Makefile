@@ -132,10 +132,53 @@ verify: ## Smoke-test the current stack (run after `make up` in another shell)
 	@ans=$$(kubectl --context $(KUBE_CTX) auth can-i get secrets --as=system:serviceaccount:default:ingest-svc-sa -n default 2>/dev/null || true); \
 	  echo "$$ans"; \
 	  [ "$$ans" = "no" ] || (echo "  expected NO — no secret grant for ingest-svc"; exit 1)
+	@echo
+	@echo "== T9 anomaly detection — backfill history, spike today, batch detect =="
+	@today=$$(date +%Y-%m-%d); \
+	  echo "  backfilling 7 days of baseline (skipped days already present will be re-ingested and no-op via idempotency)..."; \
+	  for i in 1 2 3 4 5 6 7; do \
+	    day=$$(date -v-$${i}d +%Y-%m-%d 2>/dev/null || date -d "$$i days ago" +%Y-%m-%d); \
+	    python3 data/generator/generate.py --day $$day --count 100 --seed $$((100+i)) --url http://localhost:8080/ingest 2>&1 | tail -1; \
+	  done; \
+	  echo "  seeding today with 4x spike on cc-payments-001/ec2..."; \
+	  python3 data/generator/generate.py --day $$today --count 100 --seed 999 --spike cc-payments-001:ec2:4.0 --url http://localhost:8080/ingest 2>&1 | tail -1; \
+	  sleep 5; \
+	  echo "  triggering batch detection for $$today..."; \
+	  resp=$$(curl -sS -X POST "http://localhost:8081/detect?day=$$today"); \
+	  echo "    $$resp"; \
+	  det=$$(echo "$$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin)["detected"])'); \
+	  dup=$$(echo "$$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin)["duplicate"])'); \
+	  echo "    → detected new: $$det, marked as duplicate: $$dup"; \
+	  total=$$((det + dup)); \
+	  [ "$$total" -ge 1 ] || (echo "  expected at least one anomaly (new or already-detected)"; exit 1); \
+	  echo "  anomaly rows persisted in Postgres:"; \
+	  kubectl --context $(KUBE_CTX) -n data exec deploy/postgres -- psql -U dapr -d state -tAc \
+	    "SELECT count(*) FROM state WHERE key LIKE 'rollup-svc||anomaly:$$today:%'" | (read n; echo "    $$n"; [ "$$n" -ge 1 ] || (echo "    expected \u22651 anomaly persisted"; exit 1)); \
+	  echo "  anomaly.detected queue in RabbitMQ (subscribers will exist in T11):"; \
+	  kubectl --context $(KUBE_CTX) -n data exec deploy/rabbitmq -- sh -c 'rabbitmqctl list_exchanges name type 2>/dev/null | grep anomaly || echo "    (exchange auto-created on first publish)"'
 
 .PHONY: seed
 seed: ## Post synthetic line items to ingest-svc (COUNT defaults to 100, DAY to today)
 	python3 data/generator/generate.py --day $${DAY:-$$(date +%Y-%m-%d)} --count $${COUNT:-100} --seed $${SEED:-42} --url http://localhost:8080/ingest
+
+.PHONY: backfill
+backfill: ## Post 7 days of baseline synthetic history (yesterday .. 7 days ago)
+	@for i in 1 2 3 4 5 6 7; do \
+	  day=$$(date -v-$${i}d +%Y-%m-%d 2>/dev/null || date -d "$$i days ago" +%Y-%m-%d); \
+	  echo "  backfilling day=$$day"; \
+	  python3 data/generator/generate.py --day $$day --count 100 --seed $$((100+i)) --url http://localhost:8080/ingest 2>&1 | tail -1; \
+	done
+
+.PHONY: anomaly-demo
+anomaly-demo: ## Seed today's data with a 4x spike on team-payments/ec2 and trigger detection
+	@today=$$(date +%Y-%m-%d); \
+	  echo "  seeding today ($$today) with 4x spike on cc-payments-001/ec2..."; \
+	  python3 data/generator/generate.py --day $$today --count 100 --seed 999 --spike cc-payments-001:ec2:4.0 --url http://localhost:8080/ingest 2>&1 | tail -1; \
+	  sleep 3; \
+	  echo "  triggering batch detection..."; \
+	  curl -sS -X POST "http://localhost:8081/detect?day=$$today" | python3 -m json.tool; \
+	  echo "  rollup-svc /stats:"; \
+	  curl -sS http://localhost:8081/stats | python3 -m json.tool | sed 's/^/    /'
 
 ## ---- Cluster lifecycle ----------------------------------------------------
 

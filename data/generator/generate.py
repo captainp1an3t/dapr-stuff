@@ -44,8 +44,18 @@ UNITS = ["Hrs", "GB-Mo", "Requests"]
 
 
 def generate(
-    day: str, count: int, rng: random.Random, unmapped_pct: int
+    day: str,
+    count: int,
+    rng: random.Random,
+    unmapped_pct: int,
+    spike: tuple[str, str, float] | None = None,
 ) -> Iterable[dict]:
+    """Yield synthetic line items.
+
+    If `spike=(cost_center_id, service, multiplier)` is provided, any generated
+    item matching that cost-center + service has its cost multiplied by
+    `multiplier`. Used to inject deterministic anomalies for demos.
+    """
     for seq in range(count):
         # Some fraction of items get an unknown cost-center; a smaller fraction
         # get no cost-center tag at all. Both count as "unmapped" downstream.
@@ -61,11 +71,18 @@ def generate(
         if cc is not None:
             tags["cost-center"] = cc
 
+        service = rng.choice(SERVICES)
+        cost = round(rng.uniform(0.01, 500.0), 4)
+        if spike is not None:
+            spike_cc, spike_svc, multiplier = spike
+            if cc == spike_cc and service == spike_svc:
+                cost = round(cost * multiplier, 4)
+
         yield {
             "line_item_id": f"li-{day}-{seq:06d}",
             "day": day,
-            "service": rng.choice(SERVICES),
-            "cost_usd": round(rng.uniform(0.01, 500.0), 4),
+            "service": service,
+            "cost_usd": cost,
             "quantity": round(rng.uniform(0.1, 100.0), 2),
             "unit": rng.choice(UNITS),
             "tags": tags,
@@ -96,6 +113,11 @@ def main() -> int:
         default=5,
         help="percent of items with unknown or missing cost-center (0-100)",
     )
+    p.add_argument(
+        "--spike",
+        default=None,
+        help="deterministically inflate a specific (cost_center:service) combo, e.g. cc-payments-001:ec2:3.0",
+    )
     group = p.add_mutually_exclusive_group()
     group.add_argument(
         "--url",
@@ -109,8 +131,16 @@ def main() -> int:
     )
     args = p.parse_args()
 
+    spike: tuple[str, str, float] | None = None
+    if args.spike:
+        parts = args.spike.split(":")
+        if len(parts) != 3:
+            print("--spike must be CC_ID:SERVICE:MULTIPLIER", file=sys.stderr)
+            return 2
+        spike = (parts[0], parts[1], float(parts[2]))
+
     rng = random.Random(args.seed)
-    items = list(generate(args.day, args.count, rng, args.unmapped_pct))
+    items = list(generate(args.day, args.count, rng, args.unmapped_pct, spike))
     body = to_ndjson(items)
 
     if args.output is not None:

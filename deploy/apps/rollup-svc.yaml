@@ -34,6 +34,14 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          volumeMounts:
+            # Same ConfigMap ingest-svc mounts. We share the reference data
+            # rather than reading it from Dapr state — cross-app state access
+            # would require disabling keyPrefix isolation, which we don't want.
+            # See NOTES.md T9 for the analysis.
+            - name: seed
+              mountPath: /seed
+              readOnly: true
           resources:
             requests:
               cpu: 50m
@@ -52,6 +60,10 @@ spec:
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10
+      volumes:
+        - name: seed
+          configMap:
+            name: cost-center-seed
 ---
 apiVersion: v1
 kind: Service
