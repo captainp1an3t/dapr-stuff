@@ -75,6 +75,7 @@ k8s_yaml([
     'deploy/dapr/pubsub-rabbitmq.yaml',
     'deploy/dapr/secretstore-kubernetes.yaml',
     'deploy/dapr/subscription-line-item-enriched.yaml',
+    'deploy/dapr/subscription-anomaly-detected.yaml',
 ])
 
 # ---- Services ----
@@ -94,9 +95,18 @@ docker_build(
     ignore=['**/*.md', '**/*_test.go'],
 )
 
+docker_build(
+    'dapr-stuff/triage-svc',
+    context='services/',
+    dockerfile='services/triage-svc/Dockerfile',
+    only=['triage-svc/', 'shared/'],
+    ignore=['**/*.md', '**/*_test.go'],
+)
+
 k8s_yaml([
     'deploy/apps/ingest-svc.yaml',
     'deploy/apps/rollup-svc.yaml',
+    'deploy/apps/triage-svc.yaml',
     'deploy/apps/secret-demo.yaml',
 ])
 k8s_resource(
@@ -111,6 +121,13 @@ k8s_resource(
     'rollup-svc',
     port_forwards=[
         port_forward(8081, 8080, name='app'),
+    ],
+    labels=['apps'],
+)
+k8s_resource(
+    'triage-svc',
+    port_forwards=[
+        port_forward(8082, 8080, name='app'),
     ],
     labels=['apps'],
 )

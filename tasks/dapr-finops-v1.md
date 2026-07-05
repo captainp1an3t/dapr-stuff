@@ -231,7 +231,7 @@ Add Postgres as a Grafana datasource. Create one dashboard showing per-team dail
 
 ---
 
-## - [ ] T11: `triage-svc` skeleton + Dapr Workflow hosting
+## - [x] T11: `triage-svc` skeleton + Dapr Workflow hosting
 
 **Type**: AFK
 **Blocked by**: T9
@@ -244,10 +244,10 @@ TDD focus: the subscriber-to-workflow-start handoff. Assert a workflow instance 
 
 ### Acceptance criteria
 
-- [ ] Anomaly event triggers a workflow instance
-- [ ] The workflow completes and its state is queryable via the Dapr workflow API
-- [ ] Placement service is running and the workflow host is registered with it
-- [ ] `NOTES.md`: "Dapr Workflows require actor infrastructure even though we deferred actors" — note the leaky-abstraction observation
+- [x] Anomaly event triggers a workflow instance
+- [x] The workflow completes and its state is queryable via the Dapr workflow API
+- [x] Placement service is running and the workflow host is registered with it
+- [x] `NOTES.md`: "Dapr Workflows require actor infrastructure even though we deferred actors" — note the leaky-abstraction observation
 
 ---
 

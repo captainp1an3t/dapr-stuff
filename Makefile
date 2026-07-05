@@ -171,6 +171,25 @@ verify: ## Smoke-test the current stack (run after `make up` in another shell)
 		  -d "{\"queries\":[{\"refId\":\"A\",\"datasource\":{\"type\":\"postgres\",\"uid\":\"postgres\"},\"format\":\"table\",\"rawSql\":\"SELECT count(*) FROM state WHERE key LIKE '"'"'rollup-svc||rollup:%'"'"'\"}]}" \
 		  http://kube-prom-stack-grafana.$(MONITORING_NS).svc.cluster.local/api/ds/query' \
 	  | python3 -c 'import sys,json; d=json.load(sys.stdin); n=d["results"]["A"]["frames"][0]["data"]["values"][0][0]; print(f"    rollup rows visible via Grafana Postgres datasource: {n}")'
+	@echo
+	@echo "== T11 triage-svc + workflow =="
+	kubectl --context $(KUBE_CTX) wait --for=condition=Ready pod -l app=triage-svc --timeout=90s
+	@containers=$$(kubectl --context $(KUBE_CTX) get pod -l app=triage-svc -o jsonpath='{.items[0].spec.containers[*].name}'); \
+	  echo "  triage-svc containers: $$containers"; \
+	  echo "$$containers" | grep -qw triage && echo "$$containers" | grep -qw daprd && echo "  sidecar injected OK" || (echo "  MISSING triage or daprd"; exit 1)
+	@kubectl --context $(KUBE_CTX) get subscription sub-anomaly-detected >/dev/null && echo "  Subscription sub-anomaly-detected OK" || (echo "  Subscription MISSING"; exit 1)
+	@echo "  triage-svc /stats after anomaly batch:"
+	@sleep 4
+	@curl -sS http://localhost:8082/stats | sed 's/^/    /'
+	@echo "  workflow instance for the most recent anomaly:"
+	@aid=$$(kubectl --context $(KUBE_CTX) -n data exec deploy/postgres -- psql -U dapr -d state -tAc \
+	  "SELECT convert_from(value,'UTF8')::jsonb->>'day' || ':' || (convert_from(value,'UTF8')::jsonb->>'team_id') || ':' || (convert_from(value,'UTF8')::jsonb->>'service') FROM state WHERE key LIKE 'rollup-svc||anomaly:%' ORDER BY key DESC LIMIT 1"); \
+	  if [ -z "$$aid" ]; then echo "    no anomalies in postgres — did T9 run?"; exit 1; fi; \
+	  wf_id="triage-anomaly-$$(echo $$aid | tr ':' '-')"; \
+	  echo "    querying workflow id: $$wf_id"; \
+	  resp=$$(curl -sS http://localhost:8082/workflows/$$wf_id); \
+	  echo "$$resp" | python3 -m json.tool | sed 's/^/    /' | head -15; \
+	  echo "$$resp" | grep -q '"name":"TriageWorkflow"' && echo "  workflow metadata retrievable OK" || (echo "  workflow NOT found — check triage-svc logs"; exit 1)
 
 .PHONY: seed
 seed: ## Post synthetic line items to ingest-svc (COUNT defaults to 100, DAY to today)

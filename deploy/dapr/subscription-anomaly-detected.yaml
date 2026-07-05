@@ -1,0 +1,17 @@
+# Declarative Dapr Subscription — routes messages on `anomaly.detected`
+# via `pubsub-rabbitmq` to `triage-svc /events/anomaly-detected`.
+# Scoped so only triage-svc receives; other Dapr apps in the namespace
+# aren't accidentally cc'd on anomaly traffic.
+
+apiVersion: dapr.io/v2alpha1
+kind: Subscription
+metadata:
+  name: sub-anomaly-detected
+  namespace: default
+spec:
+  topic: anomaly.detected
+  pubsubname: pubsub-rabbitmq
+  routes:
+    default: /events/anomaly-detected
+scopes:
+  - triage-svc

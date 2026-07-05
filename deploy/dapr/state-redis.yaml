@@ -3,6 +3,12 @@
 #   POST /v1.0/state/state-redis
 #   GET  /v1.0/state/state-redis/<key>
 #
+# ALSO: this store is designated as the actor state store (via the
+# `actorStateStore: "true"` metadata below). Dapr Workflows are built on
+# top of virtual actors, and the workflow engine needs SOME state store
+# with this flag set to persist workflow instances. Redis is a common
+# choice — low latency, TTL-friendly.
+#
 # No password on the Redis instance for demo simplicity.
 
 apiVersion: dapr.io/v1alpha1
@@ -18,3 +24,5 @@ spec:
       value: "redis.data.svc.cluster.local:6379"
     - name: redisPassword
       value: ""
+    - name: actorStateStore
+      value: "true"

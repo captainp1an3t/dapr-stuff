@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: triage-svc-sa
+  namespace: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: triage-svc
+  labels:
+    app: triage-svc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: triage-svc
+  template:
+    metadata:
+      labels:
+        app: triage-svc
+      annotations:
+        dapr.io/enabled: "true"
+        dapr.io/app-id: "triage-svc"
+        dapr.io/app-port: "8080"
+        dapr.io/app-protocol: "http"
+        dapr.io/config: "appconfig"
+    spec:
+      serviceAccountName: triage-svc-sa
+      containers:
+        - name: triage
+          image: dapr-stuff/triage-svc
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: triage-svc
+spec:
+  selector:
+    app: triage-svc
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

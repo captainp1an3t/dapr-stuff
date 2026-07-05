@@ -4,4 +4,5 @@ use (
 	./services/shared
 	./services/ingest-svc
 	./services/rollup-svc
+	./services/triage-svc
 )

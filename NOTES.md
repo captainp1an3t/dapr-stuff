@@ -410,3 +410,38 @@ Provisioned dashboard, 7 panels, all pointing at the `state-postgres` DB via a P
 
 - With the dashboard live, the FinOps story is now demonstrable end-to-end without terminal commands: seed data via `make seed`, then just open the dashboard and watch totals move. That's what the pitch has been building toward.
 - Ready for T11 — triage-svc will subscribe to the `anomaly.detected` topic that's currently un-consumed, and the workflow story finally arrives.
+
+---
+
+## T11 — triage-svc + Dapr Workflow (trivial per-anomaly instance)
+
+_2026-07-05_
+
+Third domain service. Subscribes to `anomaly.detected`, and for each event schedules a Dapr Workflow instance with a deterministic ID. The workflow itself is intentionally minimal (log input, return output) — T12 grows it into the real notify→wait→escalate loop.
+
+### Pros
+
+- **Workflow-as-code lands.** `TriageWorkflow(ctx *workflow.WorkflowContext) (any, error)` is a plain Go function. Dapr handles persistence, scheduling, actor placement, timers — all invisible from inside the workflow. Compared to hand-rolling this via `workflow_instances` tables + cron + callback handlers, the code-to-behaviour ratio is genuinely striking.
+- **Deterministic instance IDs = fourth idempotency layer.** `triage-<anomaly-id>` (with colons replaced by dashes). Same anomaly delivered twice → `ScheduleNewWorkflow` returns `instance already exists` error → our `isDuplicateInstance` check ACKs and counts. Same shape as `FirstWrite` on state, `ETag` on rollup upsert, and processed-marker for line items. **Same primitive rediscovered in the workflow subsystem.**
+- **Workflow state is queryable via one API call.** `FetchWorkflowMetadata(ctx, id)` returns the whole instance record (name, status, timestamps, serialized input/output, custom status, failure details) as a typed struct. No custom "workflow_status" table to maintain.
+- **The T3 prediction cashed in exactly.** We flagged "Workflows require actor infrastructure even though we deferred actors" back in T3's NOTES. T11 hit it: `state store is not configured to use the actor runtime. Have you set the - name: actorStateStore value: "true"`. Diagnostic error message actually pointed at the fix, which is refreshingly better than most Dapr errors we've seen.
+- **41 anomalies → 41 workflow instances → 0 failures in verify.** End-to-end throughput demonstration.
+
+### Cons / Gotchas
+
+- **`actorStateStore: "true"` is a required-but-easy-to-miss piece of Dapr config.** Any state store that will host actor state — including workflow state, since Dapr Workflows are built on actors — needs this metadata flag. Not on by default. Not surfaced anywhere unless you try to use workflows or actors. Once you know it, one line of YAML. Before you know it, an internal error that doesn't tell you which component to touch until you read carefully.
+- **The workflow SDK API is different from the Dapr client SDK API.** Different import path (`github.com/dapr/go-sdk/workflow` vs `github.com/dapr/go-sdk/client`), different concepts (Worker vs Client, WithInstanceID/WithInput as free functions instead of options structs). Documentation is spread across two locations. Not hard once oriented; not obvious the first time.
+- **`WorkflowContext.SetCustomStatus` doesn't exist in Go SDK v1.11.0** despite being in the docs. First hit at compile time. Removed and used the return value as the "status" instead.
+- **Instance IDs must be `[a-zA-Z0-9_-]+` — colons and other separators are rejected.** Our anomaly IDs are `anomaly:<day>:<team>:<service>`. Had to hand-translate `:` → `-` for the instance ID.
+- **No workflow list API.** You can `Schedule`, `Fetch(id)`, `RaiseEvent`, `Terminate`, `Purge` — no `List`. Peeking at Redis keys via `redis-cli KEYS '*triage*'` works but is implementation-detail. T11.5 will add a self-managed workflow inbox as the mitigation.
+- **Workflow deployment DOES restart cleanly**, but the state that identifies an actor host lives in placement. So on rollout, in-flight workflows briefly pause while placement re-elects a host. Under demo-scale traffic, invisible; under real load, worth measuring.
+
+### Overhead
+
+- triage-svc adds one more (app + sidecar) pair. Sidecar sits at ~40 MiB like the others; app is ~15 MiB idle. Cluster total ~3.9 GiB now.
+- Every workflow instance is a virtual actor. State lives in Redis (state-redis, now flagged as `actorStateStore`). Each of the 41 completed instances is ~1-2 KB of Redis. Not measured precisely; not concerning.
+
+### Meta
+
+- **This is the T3 prediction cashing in.** Reading T3's NOTES: "Workflows require actor infrastructure even though we deferred actors." That observation was speculative when we made it. T11 confirmed it exactly, and gave us the concrete error message to point at in a pitch. **The whole NOTES.md discipline is now paying off — earlier speculative gotchas are becoming testable predictions.**
+- Ready for T11.5 (workflow inbox, ~30 min follow-up commit), then T12 (real workflow: notify → wait for ack → escalate with HTMX ack button).
