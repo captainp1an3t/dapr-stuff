@@ -479,3 +479,41 @@ Standalone reactive slice, following the T6.5 pattern (find gap → build docume
 
 - **This is the shape of every real Dapr adoption story.** You use the abstraction; you find a gap; you build a small, honest, in-Dapr mitigation; you document the trade-off; you keep shipping. The alternative — reject Dapr because it doesn't have `ListWorkflows` — throws out too much value. The truthful pitch is "here's what Dapr gives you, here's what you build yourself, here's the ratio."
 - Ready for T12 — the real workflow logic.
+
+## T13 — notifier-svc (Python, polyglot boundary)
+
+First non-Go service in the stack: a Flask app that reads a secret via the Dapr Python SDK and delivers cost-anomaly notifications. Two entry points: direct HTTP (bypasses Dapr) and Dapr service invocation (`/v1.0/invoke/notifier-svc/method/notify`). Both worked identically end-to-end on the first try. RBAC pattern reused verbatim from T6.5 — same YAML, different service account.
+
+### Pros
+
+- **The Dapr promise actually delivers here.** Same three sidecar HTTP contracts (`/v1.0/secrets/...`, `/v1.0/invoke/...`, `/v1.0/state/...`) work from Python identically to Go. Nothing about the deploy manifest changed structurally — same `dapr.io/app-id`, `dapr.io/config`, `dapr.io/app-port` annotations. **The wire contract is the API; the SDK is just ergonomics.**
+- **Zero component changes.** `secretstore-kubernetes` and `pubsub-cost-anomalies` are shared verbatim. Adding a new language did not require touching any Dapr component YAML, any RBAC beyond a new SA, or any control-plane config.
+- **Python SDK secret read is a two-liner.** `with DaprClient() as dc: dc.get_secret(store_name="secretstore-kubernetes", key="demo-secret")`. Same semantics as the Go `dc.GetSecret(...)` — the sidecar performs the actual read, the app never sees k8s API credentials.
+- **Service invocation crosses languages transparently.** POSTing to `http://localhost:3500/v1.0/invoke/notifier-svc/method/notify` from a Go client hit a Python receiver, mTLS-wrapped between sidecars, no code change on either side. This is the pitch for a polyglot org — a Go team and a Python team can share a bus + a service catalog without agreeing on frameworks.
+- **Testing story is nice.** `build_slack_payload()` is a pure function; `pytest` runs against it with zero Dapr, zero cluster, zero mocks (10 tests, 2.7s). The Dapr-touching code (secret load, HTTP handlers) is a thin skin around the pure core. This is the reusable pattern: **push Dapr calls to the edges, keep the domain pure.**
+
+### Cons
+
+- **SDK version numbers do not match the runtime.** Dapr runtime is `1.18.1`; the Python SDK we pinned is `1.14.0` (latest at the time of writing); the Go SDK is `1.11.0`. There is no version alignment guarantee between runtime and SDKs. Consumers have to check each SDK's compatibility matrix themselves. In a large org this needs a shared "supported versions" doc that gets updated on every runtime bump.
+- **Python SDK is less mature than the HTTP API.** Some Dapr features (workflows in particular) are Go-first; Python parity lags. Anyone doing workflows-in-Python today is either using the raw HTTP API or accepting whatever the SDK currently supports. The pitch has to be honest: "SDK maturity varies by language; the HTTP contract does not."
+- **Base-image duplication.** The Python service can't reuse `dapr-stuff/base-runtime` (alpine) — it needs `python:3.12-alpine` as its base. So the CA-append pattern is copy-pasted into `services/notifier-svc/Dockerfile` rather than inherited. Not a Dapr problem, but a polyglot cost: **every language family gets its own base image tree**, so shared concerns (CAs, TLS trust, logging conventions) have to be re-implemented per family. A monolithic Go shop pays this once; a polyglot Dapr shop pays it per language.
+- **No structured "Slack sink" component.** Dapr has output bindings for lots of things but nothing Slack-shaped that renders anomaly payloads for you. So we built the templating in-app. That's fine — the templating is domain logic — but if the "notify" step is really just "convert domain event → external message", we're in the same boat as any FaaS-shaped notifier.
+
+### Gotchas
+
+- **`DaprClient()` is a context manager in Python.** Idiomatic use is `with DaprClient() as dc:` per operation, or one long-lived client with explicit `close()`. The Go SDK's `NewClient()` returns a client you keep around; the Python SDK wants explicit lifetime. Mismatched mental model if you jump between the two.
+- **Secret load must be tolerant of startup order.** On cold start, the notifier-svc container comes up before its own daprd sidecar is ready. First `get_secret()` call gets connection-refused. We handled this with an env-var override (`SLACK_WEBHOOK_OVERRIDE`) for dev and a startup retry loop for real. **Every Dapr-SDK app needs a retry on first sidecar call** — this is universal, not Python-specific, but felt more acute in Python because Flask starts *fast* and beats daprd to the port.
+- **The `example.local` webhook URL is the demo's "mock mode" switch.** If the secret resolves to a URL containing `example.local`, `POST /notify` records the notification to the in-memory inbox and marks `delivered: mock` — no outbound HTTP. Any real URL would actually POST. This is a deliberate demo affordance so we can run end-to-end without a real Slack workspace; production would resolve to a real webhook or use an output binding.
+- **Pytest inside the container image.** We copy `test_notifier.py` into the runtime image and pin `pytest` in `requirements.txt`. Slightly bigger image, but "run the tests in the image the same way CI would" is worth the KB. If it mattered we'd split runtime and test deps.
+
+### Overhead
+
+- Notifier pod steady-state RSS: ~85 MiB (Flask + Python 3.12 baseline + Dapr SDK). Daprd sidecar next to it: ~50 MiB. So the "cost of adding a Python service" is ~135 MiB memory + one sidecar's CPU, on top of the pod-count linear scaling we already have.
+- 5 files added for a new language: `Dockerfile`, `requirements.txt`, `notifier.py`, `test_notifier.py`, `deploy/apps/notifier-svc.yaml`. Nothing structural changed elsewhere except the Tiltfile getting one `docker_build` + one `k8s_resource` block. **Adding a language is a bounded task once the first one exists.**
+- No new Dapr components, no new RBAC rules beyond a per-service SA + Role scoped to `resourceNames: [demo-secret]`. RBAC scales with services, not with languages.
+
+### Meta
+
+- **This is the strongest Dapr moment in the demo so far.** Everything else Dapr does — state, pub/sub, workflows — you can rebuild in any framework. But *"deploy a Python service that reads secrets, receives HTTP, gets called by service invocation from a Go peer, all with zero new infrastructure and identical wire semantics"* — that is exactly the pitch. **The polyglot boundary is where Dapr's centralised concerns pay for themselves.**
+- The counter-pitch: **most orgs are single-language-per-service-team.** If a target org's teams are mostly Java or mostly Go, this benefit is theoretical. The pitch has to include: "who is the polyglot consumer? if the answer is 'nobody', halve the benefit."
+- Ready for T12 — the workflow slice that calls this service from a Go activity, closing the loop on "one Dapr concept (service invocation) crossing one language boundary in production shape."

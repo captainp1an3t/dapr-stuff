@@ -198,6 +198,33 @@ verify: ## Smoke-test the current stack (run after `make up` in another shell)
 	  [ "$$cnt" -ge 1 ] || (echo "  expected at least 1 workflow — none indexed"; exit 1); \
 	  echo "  first 3 entries:"; \
 	  echo "$$resp" | python3 -c 'import sys,json; [print("    " + w["id"] + "  status=" + w["status_name"]) for w in json.load(sys.stdin)["workflows"][:3]]'
+	@echo
+	@echo "== T13 notifier-svc (Python + Dapr Python SDK) =="
+	kubectl --context $(KUBE_CTX) wait --for=condition=Ready pod -l app=notifier-svc --timeout=120s
+	@containers=$$(kubectl --context $(KUBE_CTX) get pod -l app=notifier-svc -o jsonpath='{.items[0].spec.containers[*].name}'); \
+	  echo "  containers: $$containers"; \
+	  echo "$$containers" | grep -qw notifier && echo "$$containers" | grep -qw daprd && echo "  sidecar injected OK" || (echo "  MISSING notifier or daprd"; exit 1)
+	@echo "  notifier-svc /stats (should show secret_read=true, webhook_source=dapr-secret):"
+	@curl -sS http://localhost:8083/stats | python3 -m json.tool | sed 's/^/    /'
+	@echo "  Direct POST /notify (host → notifier-svc, bypasses service invocation):"
+	@resp=$$(curl -sS -X POST -H 'Content-Type: application/json' \
+	    -d '{"kind":"initial","anomaly":{"day":"2026-07-04","team_id":"team-payments","team_name":"Payments Platform","service":"ec2","actual_cost_usd":7565.42,"baseline_cost_usd":850,"delta_pct":789.5}}' \
+	    http://localhost:8083/notify); \
+	  echo "    $$resp"
+	@echo "  POST via Dapr service invocation (host → daprd on ingest-svc → daprd on notifier-svc → notifier-svc):"
+	@resp=$$(curl -sS -X POST -H 'Content-Type: application/json' \
+	    -d '{"kind":"escalation","anomaly":{"day":"2026-07-04","team_id":"team-search","team_name":"Search","service":"s3","actual_cost_usd":1200,"baseline_cost_usd":300,"delta_pct":300}}' \
+	    http://localhost:3500/v1.0/invoke/notifier-svc/method/notify); \
+	  echo "    $$resp"
+	@echo "  notifier-svc /inbox (should show both notifications, kind=initial and kind=escalation):"
+	@curl -sS http://localhost:8083/inbox | python3 -m json.tool | head -20 | sed 's/^/    /'
+	@echo "  RBAC — notifier-svc-sa can get demo-secret; other SAs cannot:"
+	@ans=$$(kubectl --context $(KUBE_CTX) auth can-i get secrets/demo-secret --as=system:serviceaccount:default:notifier-svc-sa -n default 2>/dev/null || true); \
+	  echo "    notifier-svc-sa can-i get secrets/demo-secret: $$ans"; \
+	  [ "$$ans" = "yes" ] || (echo "  expected YES"; exit 1)
+	@ans=$$(kubectl --context $(KUBE_CTX) auth can-i get secrets --as=system:serviceaccount:default:triage-svc-sa -n default 2>/dev/null || true); \
+	  echo "    triage-svc-sa   can-i get secrets:             $$ans"; \
+	  [ "$$ans" = "no" ] || (echo "  expected NO — isolation broken"; exit 1)
 
 .PHONY: seed
 seed: ## Post synthetic line items to ingest-svc (COUNT defaults to 100, DAY to today)

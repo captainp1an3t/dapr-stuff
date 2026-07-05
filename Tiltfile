@@ -103,10 +103,19 @@ docker_build(
     ignore=['**/*.md', '**/*_test.go'],
 )
 
+docker_build(
+    'dapr-stuff/notifier-svc',
+    context='.',                            # need .ca-extras.pem at repo root
+    dockerfile='services/notifier-svc/Dockerfile',
+    only=['services/notifier-svc/', '.ca-extras.pem'],
+    ignore=['**/*.md', '**/__pycache__/', '**/.venv/', '**/.pytest_cache/'],
+)
+
 k8s_yaml([
     'deploy/apps/ingest-svc.yaml',
     'deploy/apps/rollup-svc.yaml',
     'deploy/apps/triage-svc.yaml',
+    'deploy/apps/notifier-svc.yaml',
     'deploy/apps/secret-demo.yaml',
 ])
 k8s_resource(
@@ -128,6 +137,13 @@ k8s_resource(
     'triage-svc',
     port_forwards=[
         port_forward(8082, 8080, name='app'),
+    ],
+    labels=['apps'],
+)
+k8s_resource(
+    'notifier-svc',
+    port_forwards=[
+        port_forward(8083, 8080, name='app'),
     ],
     labels=['apps'],
 )

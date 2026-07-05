@@ -251,7 +251,7 @@ TDD focus: the subscriber-to-workflow-start handoff. Assert a workflow instance 
 
 ---
 
-## - [ ] T13: `notifier-svc` (Python) — secret-read + service invocation target
+## - [x] T13: `notifier-svc` (Python) — secret-read + service invocation target
 
 **Type**: AFK
 **Blocked by**: T6

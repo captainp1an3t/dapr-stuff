@@ -1,0 +1,94 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: notifier-svc-sa
+  namespace: default
+---
+# Explicit least-privilege secret access — same pattern as hello-svc had in
+# T6.5. Grants notifier-svc-sa `get` on the specific secret it needs to
+# resolve its Slack webhook URL, and nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: notifier-svc-secret-reader
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+    resourceNames: ["demo-secret"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: notifier-svc-secret-reader
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: notifier-svc-secret-reader
+subjects:
+  - kind: ServiceAccount
+    name: notifier-svc-sa
+    namespace: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notifier-svc
+  labels:
+    app: notifier-svc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notifier-svc
+  template:
+    metadata:
+      labels:
+        app: notifier-svc
+      annotations:
+        dapr.io/enabled: "true"
+        dapr.io/app-id: "notifier-svc"
+        dapr.io/app-port: "8080"
+        dapr.io/app-protocol: "http"
+        dapr.io/config: "appconfig"
+    spec:
+      serviceAccountName: notifier-svc-sa
+      containers:
+        - name: notifier
+          image: dapr-stuff/notifier-svc
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notifier-svc
+spec:
+  selector:
+    app: notifier-svc
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
