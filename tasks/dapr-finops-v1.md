@@ -214,7 +214,7 @@ TDD focus: the baseline + threshold logic is pure math — cover exhaustively. I
 
 ---
 
-## - [ ] T10: Grafana dashboard for rollups and anomalies
+## - [x] T10: Grafana dashboard for rollups and anomalies
 
 **Type**: AFK
 **Blocked by**: T9
@@ -225,9 +225,9 @@ Add Postgres as a Grafana datasource. Create one dashboard showing per-team dail
 
 ### Acceptance criteria
 
-- [ ] Dashboard is provisioned automatically when Grafana boots (no manual clicking)
-- [ ] Seeded data produces a visually recognisable spend chart with an anomaly marker
-- [ ] Dashboard JSON lives in the repo and is version-controlled
+- [x] Dashboard is provisioned automatically when Grafana boots (no manual clicking)
+- [x] Seeded data produces a visually recognisable spend chart with an anomaly marker
+- [x] Dashboard JSON lives in the repo and is version-controlled
 
 ---
 

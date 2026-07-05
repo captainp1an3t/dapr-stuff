@@ -35,7 +35,7 @@ grafana:
   service:
     type: ClusterIP
     port: 80
-  # Prometheus is auto-provisioned by the chart. We add Tempo here.
+  # Prometheus is auto-provisioned by the chart. We add Tempo + Postgres here.
   additionalDataSources:
     - name: Tempo
       type: tempo
@@ -48,6 +48,24 @@ grafana:
           datasourceUid: prometheus
         tracesToLogs:
           datasourceUid: prometheus
+      editable: true
+    # Postgres datasource for the FinOps rollup + anomaly dashboard (T10).
+    # Points at the same `state` DB Dapr's state-postgres component writes to;
+    # values are stored as bytea and cast to jsonb per-query.
+    - name: Postgres
+      type: postgres
+      uid: postgres
+      access: proxy
+      url: postgres.data.svc.cluster.local:5432
+      user: dapr
+      secureJsonData:
+        password: daprdemo
+      jsonData:
+        # Grafana v11+ requires `database` inside jsonData, not at top level.
+        database: state
+        sslmode: disable
+        postgresVersion: 1600
+        timescaledb: false
       editable: true
 
 # Node-exporter: needed for the standard "Kubernetes" dashboards. Leave on.

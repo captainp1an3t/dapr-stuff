@@ -380,3 +380,33 @@ Pure `Detect(current, history, cfg, now) → *Anomaly` in shared/finops; rollup-
   3. `anomaly:<day>:<team>:<service>` — no duplicate anomaly publish across trigger types
   Each is ~5 lines of Go. **Dapr state's concurrency options are the single most valuable feature we've exercised for correctness so far.**
 - Ready for T10 (Grafana dashboard on the rollups) and T11 (triage-svc subscribing to `anomaly.detected` and driving a workflow).
+
+---
+
+## T10 — Grafana FinOps dashboard on Postgres
+
+_2026-07-04_
+
+Provisioned dashboard, 7 panels, all pointing at the `state-postgres` DB via a Postgres datasource. Sidecar-based provisioning through a labelled ConfigMap so the dashboard survives cluster teardown and lives entirely in the repo.
+
+### Pros
+
+- **Zero manual clicking.** `deploy/infra/grafana-dashboards/finops-overview.json` is the whole dashboard; `make dashboards-install` wraps it into a `grafana_dashboard=1`-labelled ConfigMap in the monitoring namespace, and the kube-prom-stack Grafana sidecar picks it up within seconds. Same lifecycle as everything else in the repo.
+- **Same Postgres Dapr writes to is directly queryable.** The T4 pro ("data is really in the backend, plaintext") pays off here: Grafana queries `SELECT convert_from(value,'UTF8')::jsonb->>'team_id' ...` against the exact rows rollup-svc writes. No dedicated read model, no ETL, no Dapr on the read path at all.
+- **Template variable `$latest_day` makes "today" concrete in every panel title.** Query: `SELECT MAX(day) FROM rollups`. Every stat becomes "Total Spend — 2026-07-04" instead of the ambiguous "Total Spend Today". Also exposes a dropdown so demoers can pick any prior day and all "latest day" panels re-render.
+
+### Cons / Gotchas
+
+- **Timezone-in-`now()` is a real trap for demo dashboards.** First cut used `WHERE day = to_char(now(), 'YYYY-MM-DD')`, which evaluates in the Postgres pod's timezone (UTC). If you're running the demo in PDT after ~5 PM, `now()` in the pod is already tomorrow, the filter matches no rows, and "Total Spend Today" shows $0. Fix: don't rely on server-side clock — either use `MAX(day)` from the data itself (what we did), or explicitly cast: `now() AT TIME ZONE 'America/Los_Angeles'`. **Lesson: the data's notion of "current" is what you should trust, not the DB's.**
+- **Grafana v11+ moved the Postgres `database` field.** Old provisioning YAML had `database: state` at the top level of the datasource definition; v11 requires `jsonData.database: state`. Symptom: the UI shows "*You do not currently have a default database configured for this data source*" and every query returns "no database" errors. Not documented in a way that surfaces on the datasource config page — you have to know to look in the migration notes. Same class of leak as the Dapr version-mismatch gotcha from T8: unclear where the docs say the truth.
+- **Colour thresholds on stats need per-panel thought.** Default reflex is green→orange→red on numeric stats, which makes sense for **anomalies** (red means "action needed") but is misleading for **total spend** (spending money isn't inherently red-alarm-worthy). Made Total Spend / Line Items neutral-blue, kept red on Anomaly Count. Rule: **thresholds only where "high == bad" is universally true.**
+- **Dashboard JSON is verbose and lightly documented.** Hand-authoring 300 lines of Grafana schema-v39 JSON is tedious and error-prone; typos silently produce empty panels rather than clear errors. Real teams typically manage dashboards via terraform-grafana or grafanactl. For a demo, hand-writing was fastest. Not scalable past 5-10 dashboards.
+
+### Overhead
+
+- No new pods. One ConfigMap (~10 KiB). Sidecar-driven reload is nearly instant. Zero Dapr surface.
+
+### Meta
+
+- With the dashboard live, the FinOps story is now demonstrable end-to-end without terminal commands: seed data via `make seed`, then just open the dashboard and watch totals move. That's what the pitch has been building toward.
+- Ready for T11 — triage-svc will subscribe to the `anomaly.detected` topic that's currently un-consumed, and the workflow story finally arrives.

@@ -42,7 +42,7 @@ verify: ## Smoke-test the current stack (run after `make up` in another shell)
 	@echo
 	@echo "== Grafana datasources healthy =="
 	@kubectl --context $(KUBE_CTX) run gf-check --rm -i --restart=Never --image=curlimages/curl:8.10.1 --quiet -- \
-		sh -c 'for ds in Prometheus Tempo; do \
+		sh -c 'for ds in Prometheus Tempo Postgres; do \
 		  code=$$(curl -sS -o /tmp/out -w "%{http_code}" -u admin:admin http://kube-prom-stack-grafana.$(MONITORING_NS).svc.cluster.local/api/datasources/name/$$ds); \
 		  if [ "$$code" = "200" ]; then echo "  $$ds datasource OK"; else echo "  $$ds datasource FAIL ($$code)"; cat /tmp/out; exit 1; fi; \
 		done'
@@ -156,6 +156,21 @@ verify: ## Smoke-test the current stack (run after `make up` in another shell)
 	    "SELECT count(*) FROM state WHERE key LIKE 'rollup-svc||anomaly:$$today:%'" | (read n; echo "    $$n"; [ "$$n" -ge 1 ] || (echo "    expected \u22651 anomaly persisted"; exit 1)); \
 	  echo "  anomaly.detected queue in RabbitMQ (subscribers will exist in T11):"; \
 	  kubectl --context $(KUBE_CTX) -n data exec deploy/rabbitmq -- sh -c 'rabbitmqctl list_exchanges name type 2>/dev/null | grep anomaly || echo "    (exchange auto-created on first publish)"'
+	@echo
+	@echo "== T10 Grafana FinOps dashboard =="
+	@kubectl --context $(KUBE_CTX) -n $(MONITORING_NS) get configmap grafana-dashboards-finops -o jsonpath='{.metadata.labels.grafana_dashboard}' 2>/dev/null | (read v; if [ "$$v" = "1" ]; then echo "  ConfigMap grafana-dashboards-finops labelled OK"; else echo "  ConfigMap MISSING or unlabelled"; exit 1; fi)
+	@kubectl --context $(KUBE_CTX) run gf-dash-check --rm -i --restart=Never --image=curlimages/curl:8.10.1 --quiet -- \
+		sh -c 'code=$$(curl -sS -o /tmp/out -w "%{http_code}" -u admin:admin http://kube-prom-stack-grafana.$(MONITORING_NS).svc.cluster.local/api/dashboards/uid/finops-overview); \
+		  if [ "$$code" = "200" ]; then \
+		    title=$$(grep -o "\"title\":\"[^\"]*\"" /tmp/out | head -1 | cut -d\" -f4); \
+		    echo "  Grafana dashboard loaded — uid=finops-overview, title=$$title  OK"; \
+		  else echo "  dashboard NOT found ($$code)"; cat /tmp/out; exit 1; fi'
+	@echo "  sample Postgres query via Grafana ds proxy:"
+	@kubectl --context $(KUBE_CTX) run gf-ds-query --rm -i --restart=Never --image=curlimages/curl:8.10.1 --quiet -- \
+		sh -c 'curl -sS -u admin:admin -X POST -H "Content-Type: application/json" \
+		  -d "{\"queries\":[{\"refId\":\"A\",\"datasource\":{\"type\":\"postgres\",\"uid\":\"postgres\"},\"format\":\"table\",\"rawSql\":\"SELECT count(*) FROM state WHERE key LIKE '"'"'rollup-svc||rollup:%'"'"'\"}]}" \
+		  http://kube-prom-stack-grafana.$(MONITORING_NS).svc.cluster.local/api/ds/query' \
+	  | python3 -c 'import sys,json; d=json.load(sys.stdin); n=d["results"]["A"]["frames"][0]["data"]["values"][0][0]; print(f"    rollup rows visible via Grafana Postgres datasource: {n}")'
 
 .PHONY: seed
 seed: ## Post synthetic line items to ingest-svc (COUNT defaults to 100, DAY to today)
@@ -242,7 +257,7 @@ infra-repos: ## Add and update the Helm repos used by infra
 	helm repo update >/dev/null
 
 .PHONY: infra-install
-infra-install: infra-repos ## Install kube-prometheus-stack + tempo + otel-collector
+infra-install: infra-repos ## Install kube-prometheus-stack + tempo + otel-collector + dashboards
 	kubectl --context $(KUBE_CTX) create namespace $(MONITORING_NS) --dry-run=client -o yaml | kubectl --context $(KUBE_CTX) apply -f -
 	helm --kube-context $(KUBE_CTX) upgrade --install kube-prom-stack prometheus-community/kube-prometheus-stack \
 		--namespace $(MONITORING_NS) \
@@ -256,6 +271,21 @@ infra-install: infra-repos ## Install kube-prometheus-stack + tempo + otel-colle
 		--namespace $(MONITORING_NS) \
 		--values deploy/infra/values/otel-collector.yaml \
 		--wait --timeout 3m
+	$(MAKE) dashboards-install
+
+.PHONY: dashboards-install
+dashboards-install: ## Provision the FinOps Grafana dashboard as a labelled ConfigMap
+	@# Wraps every JSON under deploy/infra/grafana-dashboards/ into a single
+	@# ConfigMap in the monitoring namespace, labelled so kube-prom-stack's
+	@# Grafana sidecar auto-loads them.
+	kubectl --context $(KUBE_CTX) create configmap grafana-dashboards-finops \
+		--namespace $(MONITORING_NS) \
+		--from-file=deploy/infra/grafana-dashboards/ \
+		--dry-run=client -o yaml \
+	| kubectl --context $(KUBE_CTX) label -f - --local --overwrite \
+		grafana_dashboard=1 \
+		-o yaml \
+	| kubectl --context $(KUBE_CTX) apply -f -
 
 .PHONY: infra-uninstall
 infra-uninstall: ## Uninstall the observability stack (keeps the cluster)
