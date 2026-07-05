@@ -225,6 +225,57 @@ verify: ## Smoke-test the current stack (run after `make up` in another shell)
 	@ans=$$(kubectl --context $(KUBE_CTX) auth can-i get secrets --as=system:serviceaccount:default:triage-svc-sa -n default 2>/dev/null || true); \
 	  echo "    triage-svc-sa   can-i get secrets:             $$ans"; \
 	  [ "$$ans" = "no" ] || (echo "  expected NO — isolation broken"; exit 1)
+	@echo
+	@echo "== T12 workflow: notify → wait → escalate (Dapr workflow SDK + service invocation) =="
+	@echo "  (triage-svc runs with ACK_TIMEOUT_SECONDS=30, MAX_ESCALATIONS=2 in-cluster — ~120s worst-case)"
+	@inbox_before=$$(curl -sS http://localhost:8083/inbox | python3 -c 'import sys,json; print(json.load(sys.stdin)["count"])'); \
+	  echo "  notifier-svc inbox count before: $$inbox_before"
+	@echo "  --- Case A: ack path — start workflow, ack immediately, expect status=acked, escalations=0"
+	@resp=$$(curl -sS -X POST -H 'Content-Type: application/json' \
+	    -d '{"day":"2026-07-04","team_id":"team-verify-ack","team_name":"Verify Ack","service":"ec2","actual_cost_usd":9000,"baseline_cost_usd":800,"delta_pct":1025}' \
+	    http://localhost:8082/triage); \
+	  echo "    start: $$resp"; \
+	  id=$$(echo "$$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin)["instance_id"])'); \
+	  echo "    instance: $$id"; \
+	  sleep 2; \
+	  ack=$$(curl -sS -X POST -H 'Content-Type: application/json' -d '{"acked_by":"verify"}' http://localhost:8082/workflows/$$id/ack); \
+	  echo "    ack: $$ack"; \
+	  sleep 3; \
+	  meta=$$(curl -sS http://localhost:8082/workflows/$$id); \
+	  status=$$(echo "$$meta" | python3 -c 'import sys,json; print(json.load(sys.stdin)["status"])'); \
+	  outcome=$$(echo "$$meta" | python3 -c 'import sys,json; print(json.loads(json.load(sys.stdin).get("serializedOutput") or "{}").get("status",""))'); \
+	  escs=$$(echo "$$meta" | python3 -c 'import sys,json; print(json.loads(json.load(sys.stdin).get("serializedOutput") or "{}").get("escalations",""))'); \
+	  echo "    status=$$status outcome=$$outcome escalations=$$escs"; \
+	  [ "$$status" = "1" ] || (echo "  expected status=1 (COMPLETED)"; exit 1); \
+	  [ "$$outcome" = "acked" ] || (echo "  expected outcome=acked"; exit 1); \
+	  [ "$$escs" = "0" ] || (echo "  expected escalations=0"; exit 1)
+	@echo "  --- Case B: timeout path — start workflow, do NOT ack, wait for escalations to fire"
+	@resp=$$(curl -sS -X POST -H 'Content-Type: application/json' \
+	    -d '{"day":"2026-07-04","team_id":"team-verify-timeout","team_name":"Verify Timeout","service":"s3","actual_cost_usd":5500,"baseline_cost_usd":500,"delta_pct":1000}' \
+	    http://localhost:8082/triage); \
+	  echo "    start: $$resp"; \
+	  id=$$(echo "$$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin)["instance_id"])'); \
+	  echo "    instance: $$id"; \
+	  echo "    waiting ~100s for 1 initial + 2 escalations + final timeout..."; \
+	  sleep 100; \
+	  meta=$$(curl -sS http://localhost:8082/workflows/$$id); \
+	  status=$$(echo "$$meta" | python3 -c 'import sys,json; print(json.load(sys.stdin)["status"])'); \
+	  outcome=$$(echo "$$meta" | python3 -c 'import sys,json; print(json.loads(json.load(sys.stdin).get("serializedOutput") or "{}").get("status",""))'); \
+	  escs=$$(echo "$$meta" | python3 -c 'import sys,json; print(json.loads(json.load(sys.stdin).get("serializedOutput") or "{}").get("escalations",""))'); \
+	  echo "    status=$$status outcome=$$outcome escalations=$$escs"; \
+	  [ "$$status" = "1" ] || (echo "  expected status=1 (COMPLETED)"; exit 1); \
+	  [ "$$outcome" = "unacked" ] || (echo "  expected outcome=unacked"; exit 1); \
+	  [ "$$escs" = "2" ] || (echo "  expected escalations=2"; exit 1)
+	@echo "  --- Inbox delta: should include 1 initial (ack-path) + 1 initial + 2 escalations (timeout-path) = 4 new"
+	@inbox_after=$$(curl -sS http://localhost:8083/inbox | python3 -c 'import sys,json; print(json.load(sys.stdin)["count"])'); \
+	  echo "  notifier-svc inbox count after: $$inbox_after"
+	@echo "  --- Recent inbox entries (kind should show initial + escalation):"
+	@curl -sS http://localhost:8083/inbox | python3 -c 'import sys,json; [print("    " + i["kind"] + "  " + i["anomaly_id"]) for i in json.load(sys.stdin)["items"][:6]]'
+	@echo "  --- HTMX ack page renders (Case-A instance, workflow completed → button hidden, outcome shown):"
+	@page=$$(curl -sS http://localhost:8082/workflows/triage-anomaly-2026-07-04-team-verify-ack-ec2/page); \
+	  echo "$$page" | grep -q 'htmx.org' && echo "    HTMX script loaded" || (echo "  MISSING htmx"; exit 1); \
+	  echo "$$page" | grep -q 'outcome acked' && echo "    Acked outcome block present" || (echo "  MISSING acked outcome"; exit 1); \
+	  echo "$$page" | grep -q '<button' && (echo "  UNEXPECTED: button should be hidden on completed workflow"; exit 1) || echo "    Button correctly hidden on completed workflow"
 
 .PHONY: seed
 seed: ## Post synthetic line items to ingest-svc (COUNT defaults to 100, DAY to today)

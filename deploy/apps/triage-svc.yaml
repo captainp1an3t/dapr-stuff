@@ -34,6 +34,17 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          env:
+            # T12 workflow tuning. 30s + 2 escalations = the minimum that
+            # gives a real human a realistic ack window (see notification,
+            # open page, read, click). Production would set these much
+            # higher (5–15 minutes per round, with the last round routed
+            # to a different recipient / channel). Verify tolerates the
+            # ~120s worst-case timeout-path run.
+            - name: ACK_TIMEOUT_SECONDS
+              value: "30"
+            - name: MAX_ESCALATIONS
+              value: "2"
           resources:
             requests:
               cpu: 50m

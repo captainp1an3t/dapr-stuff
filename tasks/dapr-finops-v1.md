@@ -291,7 +291,7 @@ Reactive slice after T11 discovered Dapr Workflow has no `List` API. Maintain a 
 
 ---
 
-## - [ ] T12: Full triage workflow — notify, wait, ack-or-escalate, HTMX page
+## - [x] T12: Full triage workflow — notify, wait, ack-or-escalate, HTMX page
 
 **Type**: HITL — timeout and escalation policy are real decisions
 **Blocked by**: T11, T13
