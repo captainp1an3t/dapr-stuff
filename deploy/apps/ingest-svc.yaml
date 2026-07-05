@@ -1,0 +1,93 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ingest-svc-sa
+  namespace: default
+---
+# Cost-center → team lookup, seeded into state-redis on ingest-svc startup.
+# Deliberately small: a handful of real-feeling names for demo readability.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cost-center-seed
+  namespace: default
+data:
+  cost-centers.json: |
+    [
+      {"cost_center_id": "cc-payments-001",  "team_id": "team-payments",  "team_name": "Payments Platform"},
+      {"cost_center_id": "cc-search-001",    "team_id": "team-search",    "team_name": "Search Platform"},
+      {"cost_center_id": "cc-checkout-001",  "team_id": "team-checkout",  "team_name": "Checkout Experience"},
+      {"cost_center_id": "cc-catalog-001",   "team_id": "team-catalog",   "team_name": "Product Catalog"},
+      {"cost_center_id": "cc-identity-001",  "team_id": "team-identity",  "team_name": "Identity & Access"},
+      {"cost_center_id": "cc-analytics-001", "team_id": "team-analytics", "team_name": "Data & Analytics"},
+      {"cost_center_id": "cc-platform-001",  "team_id": "team-platform",  "team_name": "Platform Engineering"}
+    ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest-svc
+  labels:
+    app: ingest-svc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ingest-svc
+  template:
+    metadata:
+      labels:
+        app: ingest-svc
+      annotations:
+        dapr.io/enabled: "true"
+        dapr.io/app-id: "ingest-svc"
+        dapr.io/app-port: "8080"
+        dapr.io/app-protocol: "http"
+        dapr.io/config: "appconfig"
+    spec:
+      serviceAccountName: ingest-svc-sa
+      containers:
+        - name: ingest
+          image: dapr-stuff/ingest-svc
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          volumeMounts:
+            - name: seed
+              mountPath: /seed
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: seed
+          configMap:
+            name: cost-center-seed
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingest-svc
+spec:
+  selector:
+    app: ingest-svc
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

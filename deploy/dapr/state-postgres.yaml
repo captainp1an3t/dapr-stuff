@@ -1,0 +1,20 @@
+# Dapr state store — PostgreSQL, named `state-postgres`.
+# Any Dapr-enabled pod in the `default` namespace can address it via
+#   POST /v1.0/state/state-postgres
+#   GET  /v1.0/state/state-postgres/<key>
+#
+# Dapr auto-creates its own tables (state, state_metadata) in the given DB
+# on first use. Credentials are inline for demo; production would use a Dapr
+# secret store to inject them.
+
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: state-postgres
+  namespace: default
+spec:
+  type: state.postgresql
+  version: v2
+  metadata:
+    - name: connectionString
+      value: "host=postgres.data.svc.cluster.local port=5432 user=dapr password=daprdemo dbname=state sslmode=disable"

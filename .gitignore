@@ -1,0 +1,53 @@
+# macOS
+.DS_Store
+
+# IDE / editor
+.idea/
+.vscode/*
+!.vscode/settings.json.example
+*.swp
+
+# Go
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+# Local binaries produced by `go build` inside a service directory.
+# The name matches the module — leaving these unignored pollutes diffs.
+services/*/hello-svc
+services/*/sub-svc
+services/*/ingest-svc
+services/*/rollup-svc
+services/*/triage-svc
+services/*/notifier-svc
+
+# Tilt
+tilt_modules/
+.tiltbuild/
+
+# Local env / secrets that must never be committed
+.env
+.env.local
+*.local.yaml
+kubeconfig
+kubeconfig.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Test output / coverage
+coverage.out
+*.log
+
+# Any additional trusted CA certificates required by your local dev network,
+# and any local-only tooling to produce/manage them. Both are entirely
+# outside the repo's knowledge — the repo just reads `.ca-extras.pem` if
+# present and no-ops if it's empty.
+/.ca-extras.pem
+/corp/

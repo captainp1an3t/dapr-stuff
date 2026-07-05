@@ -1,0 +1,49 @@
+# kube-prometheus-stack values — trimmed for KinD/laptop use.
+# Full chart: https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack
+
+# We don't need alerting for a learning project.
+alertmanager:
+  enabled: false
+
+# Skip the webhook cert dance — not worth the setup for a dev cluster.
+prometheusOperator:
+  admissionWebhooks:
+    enabled: false
+    patch:
+      enabled: false
+  tls:
+    enabled: false
+
+grafana:
+  adminPassword: admin
+  defaultDashboardsTimezone: browser
+
+  # Pin service to a stable port for the port-forward.
+  service:
+    port: 80
+    targetPort: 3000
+
+  # Tempo is installed via a separate chart; register it as a datasource here so
+  # Grafana can query traces without any manual UI clicking.
+  # Prometheus is auto-registered by the sidecar dashboards mechanism.
+  additionalDataSources:
+    - name: Tempo
+      type: tempo
+      uid: tempo
+      access: proxy
+      url: http://tempo.monitoring.svc.cluster.local:3100
+      jsonData:
+        httpMethod: GET
+
+prometheus:
+  prometheusSpec:
+    # Keep memory bounded for laptop use.
+    resources:
+      requests:
+        memory: 300Mi
+      limits:
+        memory: 800Mi
+    retention: 6h
+    # Allow all ServiceMonitors we create (default filter is too strict).
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false

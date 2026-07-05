@@ -1,0 +1,79 @@
+# kube-prometheus-stack values — slim install for a KinD demo cluster.
+# https://github.com/prometheus-community/helm-charts/blob/main/charts/kube-prometheus-stack/values.yaml
+
+# Alertmanager: not needed for a demo, saves memory.
+alertmanager:
+  enabled: false
+
+# Reduce Prometheus retention / footprint for laptop-scale KinD.
+prometheus:
+  prometheusSpec:
+    retention: 3d
+    resources:
+      requests:
+        cpu: 100m
+        memory: 400Mi
+      limits:
+        memory: 1Gi
+    # We want Prometheus to pick up ServiceMonitors from ANY namespace so Dapr
+    # sidecars in `default` can be scraped without extra label wiring.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+
+# Grafana: local admin password, pre-provisioned Tempo datasource so traces
+# work as soon as the OTel Collector is wired up.
+grafana:
+  adminUser: admin
+  adminPassword: admin
+  resources:
+    requests:
+      cpu: 100m
+      memory: 300Mi
+    limits:
+      memory: 512Mi
+  service:
+    type: ClusterIP
+    port: 80
+  # Prometheus is auto-provisioned by the chart. We add Tempo here.
+  additionalDataSources:
+    - name: Tempo
+      type: tempo
+      uid: tempo
+      access: proxy
+      url: http://tempo.monitoring.svc.cluster.local:3200
+      jsonData:
+        httpMethod: GET
+        serviceMap:
+          datasourceUid: prometheus
+        tracesToLogs:
+          datasourceUid: prometheus
+      editable: true
+
+# Node-exporter: needed for the standard "Kubernetes" dashboards. Leave on.
+# kube-state-metrics: same.
+
+# Reduce noise on a single-node KinD cluster.
+defaultRules:
+  create: true
+  rules:
+    kubeApiserverAvailability: false
+    kubeApiserverBurnrate: false
+    kubeApiserverHistogram: false
+    kubeApiserverSlos: false
+    etcd: false
+    kubeScheduler: false
+    kubeControllerManager: false
+
+# KinD control-plane components (controller-manager, scheduler, proxy) bind to
+# 127.0.0.1 inside the node, so a Prometheus pod on the pod network can't reach
+# them (connection refused on 10257/10259/10249). Disable the ServiceMonitors
+# entirely — we don't need control-plane metrics in a demo cluster.
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+kubeEtcd:
+  enabled: false

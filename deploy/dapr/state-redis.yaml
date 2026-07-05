@@ -1,0 +1,20 @@
+# Dapr state store — Redis, named `state-redis`.
+# Any Dapr-enabled pod in the `default` namespace can address it via
+#   POST /v1.0/state/state-redis
+#   GET  /v1.0/state/state-redis/<key>
+#
+# No password on the Redis instance for demo simplicity.
+
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: state-redis
+  namespace: default
+spec:
+  type: state.redis
+  version: v1
+  metadata:
+    - name: redisHost
+      value: "redis.data.svc.cluster.local:6379"
+    - name: redisPassword
+      value: ""

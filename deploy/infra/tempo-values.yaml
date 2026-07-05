@@ -1,0 +1,28 @@
+# Tempo values — single-binary mode for KinD/laptop use.
+# Full chart: https://github.com/grafana/helm-charts/tree/main/charts/tempo
+
+tempo:
+  # Local (in-container) trace storage — ephemeral, fine for a learning project.
+  storage:
+    trace:
+      backend: local
+      local:
+        path: /var/tempo/traces
+  retention: 6h
+  reportingEnabled: false
+  # Metrics generator adds real weight; skip for now.
+  metricsGenerator:
+    enabled: false
+
+# Ephemeral storage — trace history evaporates on pod restart, which is fine
+# because Tempo restarts should be rare and traces are cheap to regenerate.
+persistence:
+  enabled: false
+
+resources:
+  requests:
+    memory: 128Mi
+    cpu: 50m
+  limits:
+    memory: 512Mi
+    cpu: 500m

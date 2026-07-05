@@ -1,0 +1,90 @@
+# OpenTelemetry Collector — fans-in OTLP from Dapr sidecars and app code,
+# forwards to Tempo (traces) and lets Prometheus scrape it (metrics).
+# https://github.com/open-telemetry/opentelemetry-helm-charts/blob/main/charts/opentelemetry-collector/values.yaml
+#
+# Mode "deployment" runs a single replica — plenty for a demo. Use "daemonset"
+# for a real cluster if you want per-node collection.
+
+mode: deployment
+replicaCount: 1
+
+image:
+  repository: otel/opentelemetry-collector-contrib
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 100Mi
+  limits:
+    memory: 256Mi
+
+# The chart auto-creates a Service exposing OTLP receivers on 4317/4318
+# because `receivers.otlp` is enabled in the default preset. We override the
+# pipeline to fan out to Tempo (traces) and expose metrics to Prometheus.
+config:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+  processors:
+    batch: {}
+
+  exporters:
+    # Send traces to Tempo via OTLP gRPC.
+    otlp/tempo:
+      endpoint: tempo.monitoring.svc.cluster.local:4317
+      tls:
+        insecure: true
+    # Expose metrics for Prometheus to scrape.
+    prometheus:
+      endpoint: 0.0.0.0:8889
+
+  service:
+    pipelines:
+      traces:
+        receivers: [otlp]
+        processors: [batch]
+        exporters: [otlp/tempo]
+      metrics:
+        receivers: [otlp]
+        processors: [batch]
+        exporters: [prometheus]
+
+# Expose the OTLP receivers as a ClusterIP service so Dapr sidecars can send
+# their traces here (configured in a later slice).
+service:
+  enabled: true
+  type: ClusterIP
+
+ports:
+  otlp:
+    enabled: true
+    containerPort: 4317
+    servicePort: 4317
+    protocol: TCP
+  otlp-http:
+    enabled: true
+    containerPort: 4318
+    servicePort: 4318
+    protocol: TCP
+  metrics:
+    # This is what Prometheus scrapes for the app/sidecar metrics forwarded here.
+    enabled: true
+    containerPort: 8889
+    servicePort: 8889
+    protocol: TCP
+
+# ServiceMonitor so Prometheus (from kube-prometheus-stack) picks up the
+# forwarded app metrics automatically. serviceMonitorSelectorNilUsesHelmValues
+# is off in the Prometheus values, so any ServiceMonitor is scraped.
+serviceMonitor:
+  enabled: true
+  extraLabels:
+    release: kube-prom-stack
+  metricsEndpoints:
+    - port: metrics
+      interval: 15s

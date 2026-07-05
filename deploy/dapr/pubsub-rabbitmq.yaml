@@ -1,0 +1,28 @@
+# Dapr pub/sub — RabbitMQ, named `pubsub-rabbitmq`.
+# Any Dapr-enabled pod in `default` can:
+#   publish:   POST /v1.0/publish/pubsub-rabbitmq/<topic>
+#   subscribe: via a Subscription CRD that routes messages to a URL path
+#
+# Credentials inline for demo; production would use a Dapr secret store.
+
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: pubsub-rabbitmq
+  namespace: default
+spec:
+  type: pubsub.rabbitmq
+  version: v1
+  metadata:
+    - name: connectionString
+      value: "amqp://dapr:daprdemo@rabbitmq.data.svc.cluster.local:5672"
+    - name: durable
+      value: "true"
+    - name: deletedWhenUnused
+      value: "false"
+    - name: autoAck
+      value: "false"
+    - name: reconnectWait
+      value: "5"
+    - name: concurrency
+      value: "parallel"

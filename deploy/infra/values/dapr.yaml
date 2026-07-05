@@ -1,0 +1,55 @@
+# Dapr Helm values — slim install for a KinD demo cluster.
+# https://github.com/dapr/dapr/blob/master/charts/dapr/values.yaml
+
+global:
+  # HA off means single-replica control-plane components. Fine for a demo,
+  # saves ~4x the memory vs. the default 3-replica HA setup.
+  ha:
+    enabled: false
+
+  # Prometheus scraping annotations on injected sidecars.
+  # kube-prometheus-stack uses the operator/ServiceMonitor pattern rather than
+  # annotation-based scraping, so we'll add an explicit PodMonitor in a later
+  # slice when we start caring about sidecar metrics (T16).
+  prometheus:
+    enabled: true
+
+  # Log verbosity — 'info' keeps the control-plane logs readable; bump to
+  # 'debug' when investigating something specific.
+  logAsJson: false
+
+# ---- Per-component resource requests ----
+# All at low-ish requests for KinD; the operator, sentry, placement and
+# injector each idle at 20-40 MiB.
+
+dapr_operator:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+dapr_placement:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+dapr_sentry:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+dapr_sidecar_injector:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi

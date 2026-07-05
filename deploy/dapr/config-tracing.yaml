@@ -1,0 +1,18 @@
+# Dapr Configuration CRD — enables 100% tracing to our OTel Collector.
+# Referenced by the app via the `dapr.io/config: appconfig` annotation on the
+# pod template. Any Dapr-enabled pod in the same namespace can reference it.
+#
+# In production you'd sample at a low rate (0.01 = 1%). Demo = 100%.
+
+apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: appconfig
+  namespace: default
+spec:
+  tracing:
+    samplingRate: "1"
+    otel:
+      endpointAddress: otel-collector-opentelemetry-collector.monitoring.svc.cluster.local:4317
+      isSecure: false
+      protocol: grpc

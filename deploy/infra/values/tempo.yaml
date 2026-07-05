@@ -1,0 +1,39 @@
+# Tempo single-binary — smallest possible install for KinD demos.
+# https://github.com/grafana/helm-charts/blob/main/charts/tempo/values.yaml
+#
+# Storage: local filesystem inside the pod (data disappears on pod restart).
+# That's fine for a demo — traces are ephemeral by nature.
+
+tempo:
+  # Enable OTLP receivers so Dapr sidecars (T3+) can push spans directly.
+  # Alternatively the OTel Collector fans in and forwards — see otel-collector.yaml.
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+  # Generate service graph + span metrics that Grafana's Tempo panel understands.
+  metricsGenerator:
+    enabled: true
+    remoteWriteUrl: http://kube-prom-stack-prometheus.monitoring.svc.cluster.local:9090/api/v1/write
+
+  storage:
+    trace:
+      backend: local
+      local:
+        path: /var/tempo/traces
+      wal:
+        path: /var/tempo/wal
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+persistence:
+  enabled: false
