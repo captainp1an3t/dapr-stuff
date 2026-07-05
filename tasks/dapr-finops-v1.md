@@ -272,6 +272,25 @@ TDD focus: templating the notification payload and mapping anomaly context into 
 
 ---
 
+## - [x] T11.5: Workflow inbox — mitigation for Dapr's missing ListWorkflows API
+
+**Type**: AFK
+**Blocked by**: T11
+
+### What to build
+
+Reactive slice after T11 discovered Dapr Workflow has no `List` API. Maintain a self-managed index of scheduled workflow instance IDs in state-postgres, updated via ETag CAS on each successful `ScheduleNewWorkflow`. Expose `GET /workflows` on triage-svc that reads the index and returns a summary table.
+
+### Acceptance criteria
+
+- [x] `workflow-index:__all__` state key exists after workflows are scheduled
+- [x] `GET /workflows` returns a JSON summary with all scheduled instances
+- [x] Restarting triage-svc does not lose the inbox (state survives)
+- [x] Concurrent `ScheduleNewWorkflow` calls do not corrupt the index (ETag CAS)
+- [x] `NOTES.md`: the "no ListWorkflows API" gap and our in-Dapr mitigation
+
+---
+
 ## - [ ] T12: Full triage workflow — notify, wait, ack-or-escalate, HTMX page
 
 **Type**: HITL — timeout and escalation policy are real decisions

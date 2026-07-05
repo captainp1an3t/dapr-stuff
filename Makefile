@@ -190,6 +190,14 @@ verify: ## Smoke-test the current stack (run after `make up` in another shell)
 	  resp=$$(curl -sS http://localhost:8082/workflows/$$wf_id); \
 	  echo "$$resp" | python3 -m json.tool | sed 's/^/    /' | head -15; \
 	  echo "$$resp" | grep -q '"name":"TriageWorkflow"' && echo "  workflow metadata retrievable OK" || (echo "  workflow NOT found — check triage-svc logs"; exit 1)
+	@echo
+	@echo "== T11.5 workflow inbox (Dapr has no ListWorkflows API — self-managed index) =="
+	@resp=$$(curl -sS http://localhost:8082/workflows); \
+	  cnt=$$(echo "$$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin)["count"])'); \
+	  echo "  workflows in inbox: $$cnt"; \
+	  [ "$$cnt" -ge 1 ] || (echo "  expected at least 1 workflow — none indexed"; exit 1); \
+	  echo "  first 3 entries:"; \
+	  echo "$$resp" | python3 -c 'import sys,json; [print("    " + w["id"] + "  status=" + w["status_name"]) for w in json.load(sys.stdin)["workflows"][:3]]'
 
 .PHONY: seed
 seed: ## Post synthetic line items to ingest-svc (COUNT defaults to 100, DAY to today)

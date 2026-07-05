@@ -445,3 +445,37 @@ Third domain service. Subscribes to `anomaly.detected`, and for each event sched
 
 - **This is the T3 prediction cashing in.** Reading T3's NOTES: "Workflows require actor infrastructure even though we deferred actors." That observation was speculative when we made it. T11 confirmed it exactly, and gave us the concrete error message to point at in a pitch. **The whole NOTES.md discipline is now paying off — earlier speculative gotchas are becoming testable predictions.**
 - Ready for T11.5 (workflow inbox, ~30 min follow-up commit), then T12 (real workflow: notify → wait for ack → escalate with HTMX ack button).
+
+---
+
+## T11.5 — Workflow inbox (mitigation for Dapr's missing ListWorkflows API)
+
+_2026-07-05_
+
+Standalone reactive slice, following the T6.5 pattern (find gap → build documented mitigation → move on). Dapr Workflow has `Schedule / Fetch(id) / RaiseEvent / Terminate / Purge` but no `List`. Ours now does.
+
+### Implementation
+
+- Single state key: `workflow-index:__all__` in `state-postgres` (Dapr abstraction, not raw SQL).
+- On every successful `ScheduleNewWorkflow`, appended to via **ETag CAS retry loop** — same pattern rollup upserts have used since T8. When the index doesn't yet exist, first writer inserts with `FirstWrite` concurrency; subsequent writers read + append + write-with-ETag; on conflict, retry.
+- `GET /workflows` reads the array, calls `FetchWorkflowMetadata` per ID, returns a summary table (`id, name, status, status_name, created_at, last_updated_at`).
+- Best-effort update: if index write fails, log a WARN but ACK the pub/sub message anyway. The workflow itself ran successfully; the index is just for observability. Never RETRY the pubsub message on index failure (would cause duplicate `ScheduleNewWorkflow` calls, which now conflict on ID and burn cycles).
+
+### Pros
+
+- **The same primitive keeps working.** ETag CAS on an array. Fifth use of this pattern in the repo (processed-lines, rollup upsert, anomaly dedup, workflow instance IDs, workflow index). Once you see the shape, every "how do I make X idempotent under retries" question in Dapr answers itself.
+- **Stays 100% inside Dapr's state abstraction** — no fallback to raw pgx. The pitch stays clean: "we didn't have to leave Dapr to work around a Dapr gap."
+- **verify now has a genuinely useful UX check.** `curl localhost:8082/workflows` for humans looking to eyeball state without knowing individual instance IDs.
+
+### Cons / Gotchas — this IS the finding
+
+- **No ListWorkflows API in Dapr, full stop.** All of `List`, `SearchByStatus`, `SearchByName`, `List instances of workflow X` — none exist. Community threads have been asking for years. The Dapr team's position (as of this writing) is "not in scope for the durable-task engine"; the recommended path is what we did — maintain your own index in state.
+- **The master-array pattern scales linearly.** Fine for hundreds or thousands of instances; painful for millions. Real production would want a paginated + status-indexed structure (probably `workflow-index:<status>:<year-month>` shards, or a proper Postgres table hit via raw SQL).
+- **Under high schedule concurrency, the ETag CAS retries add latency to the schedule path.** In the demo 35 events arrive within ~1 second; each retries maybe 1-3 times before winning the CAS. Total added latency: ~20 ms per schedule. In a high-throughput environment this would be a hot spot — solve by sharding the index or by moving the index to a real DB with atomic array append.
+- **The "master list" is a single hot key** — a single point of contention. Same shape as any denormalised counter. Worth flagging in the pitch: "the mitigation costs us a hot key."
+- **We inherit no `runtime_status`-based query.** To answer "which workflows are still RUNNING?" you have to iterate the whole inbox and filter client-side. Real production wants server-side filtering.
+
+### Meta
+
+- **This is the shape of every real Dapr adoption story.** You use the abstraction; you find a gap; you build a small, honest, in-Dapr mitigation; you document the trade-off; you keep shipping. The alternative — reject Dapr because it doesn't have `ListWorkflows` — throws out too much value. The truthful pitch is "here's what Dapr gives you, here's what you build yourself, here's the ratio."
+- Ready for T12 — the real workflow logic.
