@@ -664,3 +664,125 @@ Scored for this slice specifically:
 - **For the pitch:** "we added a second workflow that reuses ~80% of the T12 infrastructure and 100% of the Dapr concepts. The delta is the domain — as it should be." That's the compact version.
 - **Follow-up worth ADR'ing:** "single /notify endpoint vs. per-workflow notify endpoints" — the notifier will accumulate discriminator branches; this is the moment to decide the pattern.
 - Ready for T15 (chaos / kill-things) and T16 (sidecar overhead measurement) — the last two "honest cost" slices.
+
+## T15 — chaos: kill things, observe recovery
+
+Five scripted failure scenarios (`make chaos-1..5`), each pre-positioning in-flight state, killing a target, then observing for 60–90s and trying to complete the pre-positioned work. This slice adds no features — it exists to force honest observations that would otherwise get hand-waved. **Every finding here goes on the "cons" side of the pitch by default; the ones that *don't* land there are the strongest Dapr moments.**
+
+Baseline: cluster is KinD, single node, local docker. Recovery times observed here are best-case for that reason — production nodes with real disk, image pulls, and pod-startup probes would take longer. We didn't test *long* outages (minutes+) because KinD restarts everything in <30s.
+
+### Scenario 1 — kill `notifier-svc` during an escalating workflow  ✅
+
+**Setup:** start a TriageWorkflow → wait 5s (initial notify succeeds) → delete notifier-svc pod → observe 60s.
+
+**Findings:**
+- Notifier pod restarted in ~15–20s (fresh Python + secret load).
+- **The initial notify succeeded before the kill** (arrived at old pod, was recorded, workflow moved into ack-wait).
+- **Escalations at t=30s and t=60s hit the NEW pod successfully.** Notification counter shows `received=1` at t+30s and `received=2` at t+60s (matching escalation schedule).
+- Workflow itself was suspended in `WaitForExternalEvent` throughout the outage — didn't care that notifier was down, because it wasn't actively calling it.
+
+**Verdict:** ✅ **Dapr's promise held.** Service invocation from a workflow activity survives the callee restarting, provided the activity isn't mid-flight during the outage. If the activity had been running *during* the kill, we'd see the Dapr activity retry policy kick in (not tested here — the timing worked out that all notifies happened either fully before or fully after the outage).
+
+### Scenario 2 — kill Postgres  ⚠️
+
+**Setup:** delete Postgres pod → observe 60s → try a fresh workflow.
+
+**Findings:**
+- Postgres restarted in <10s in KinD. (Would be longer in production with real volumes.)
+- App `/stats` endpoints unaffected — they're in-memory counters.
+- Fresh workflow post-recovery scheduled successfully — the state-store call for the workflow index worked once Postgres was back.
+
+**What we didn't observe:** the actual degradation window. Between t=0 (kill) and t=~10s (recovery), any state-store call from ingest-svc / rollup-svc / triage-svc *would* have failed. But no traffic hit those paths during the window because our observation snapshots only hit `/stats`.
+
+**Follow-up:** the chaos-2 target should be redesigned to actively drive state-store traffic during the outage window. As-is, it demonstrates "Postgres restarts fast in KinD" more than it stress-tests state-store failure modes.
+
+**Verdict:** ⚠️ **Not-really-tested.** Documented as a follow-up rather than a con.
+
+### Scenario 3 — kill RabbitMQ mid-ingest  ❌
+
+**Setup:** ingest 20 line items just before killing RabbitMQ → observe 60s → try another ingest.
+
+**Findings:**
+- RabbitMQ pod restarted in ~10s.
+- **`ingest.failed` went from 0 to 20** immediately. All 20 line items that were mid-publish when the broker died were **LOST** from ingest's perspective — the publisher-side Dapr call returned an error, and ingest counted them as failed. No retry, no retention, no outbox — they're gone.
+- After recovery, fresh ingests worked normally.
+
+**The real finding:** Dapr's "at-least-once" pub/sub guarantee is **subscriber-side, not publisher-side**. Once a message reaches the broker, it will be redelivered until ack'd — that's what "at-least-once" means. But if the *publisher-side* call to the broker fails (broker unreachable, sidecar retry budget exhausted, whatever), the caller sees the failure and it's on the app to retry.
+
+**Mitigation options** (any real production would need one):
+1. **Retry loop in the caller** — retry the `dc.PublishEvent(...)` with backoff. Simple but risks duplicate publishes if the first one actually landed but the response was lost.
+2. **Outbox pattern** — write the intent to a DB table first, then have a separate publisher process drain the table into pub/sub with idempotency. The classic solution; adds a table + a background process.
+3. **Dapr resiliency policies** — Dapr does support per-component retry policies, and we haven't configured any. Might mitigate; needs testing.
+
+**Verdict:** ❌ **Real gap in our current setup.** Publisher retries are the app's responsibility, we haven't implemented any, and the loss is silent (just a counter). Worth an ADR: "Publisher retry / outbox for at-least-once ingest."
+
+### Scenario 4 — restart `triage-svc` pod (whole pod) during workflow ack-wait  ✅✅
+
+**Setup:** start a workflow → wait 5s (initial notify done, workflow in ack-wait) → delete triage-svc pod (both app + daprd sidecar) → observe 60s → raise ack.
+
+**Findings:**
+- New triage-svc pod up in ~10s. `restarts=0` on the new one (K8s created a fresh replacement, didn't restart the container).
+- **Workflow status stayed 0 (RUNNING) throughout the observation window** — the workflow's actor state was in Redis via Dapr's actor state store, not in the dead pod. When the new pod came up, the actor was re-hosted and the workflow continued.
+- Escalations fired at their scheduled times (30s + 60s) during the observation window — the *durabletask timer* survived the pod restart cleanly.
+- Ack raised post-restart was accepted; workflow completed as `acked` with `escalations=2` (correctly reflects that 2 escalations happened during the outage window).
+
+**Verdict:** ✅✅ **The strongest Dapr moment in the whole chaos run.** The claim "your workflows are durable and survive pod restarts" is not marketing — it works. This is the one to lead with when someone in the audience asks "what happens when the pod dies?"
+
+**Caveat about the test:** we couldn't kill *only* the sidecar — daprd's distroless image has no shell, so `kubectl exec ... kill -9 1` failed with "no such file /bin/sh". Whole-pod delete tests a superset (both containers die simultaneously) which is actually the more common production case (OOM kill, rolling update, node drain). A pure sidecar-only kill would need `kubectl debug` with an ephemeral shell container, or `crictl` on the node.
+
+### Scenario 5 — kill Dapr `placement` control-plane pod  ✅
+
+**Setup:** start a workflow in ack-wait → delete `dapr-placement-server-0` → observe 90s → try to ack.
+
+**Findings:**
+- Placement pod restarted in ~10s (StatefulSet, so K8s brings the same identity back).
+- **Workflow ran through its complete 90-second escalation cycle** (initial + 2 escalations + final timeout) during the observation window, all while placement was restarting or freshly recovered.
+- Workflow completed as `unacked` (correct terminal state given nobody clicked ack in time).
+- Post-restart ack was accepted-but-no-op (workflow already terminal).
+
+**Verdict:** ✅ **Placement survived the restart cleanly and no in-flight work was affected.** BUT — big caveat — KinD's fast restart (~10s) means we only tested a very brief control-plane outage. A production placement pod that took 60s+ to restart (larger image, slower node, StatefulSet PVC reattach) might show actor-rescheduling delays. **The strong "workflows keep working through placement restart" claim needs re-testing on production-shaped infrastructure before being oversold.**
+
+### Common observations across all five scenarios
+
+- **KinD is a lie about recovery time.** Everything restarts in 10-15s. Real prod nodes with slower disks, image pulls, larger memory footprints, and startup probes will be 5-20× slower. Any "Dapr recovers fast" claim from this demo needs a production caveat.
+- **Failure was almost always silent from the app's perspective.** We only see problems because we're watching stats endpoints. Grafana dashboards and Tempo traces would show the same story more legibly, but nothing paged us — the failures were "counter went up", not "alert fired". In production, publishing failures to Prometheus with `severity=warning` on each app counter would surface these faster.
+- **The trace surface degrades honestly during outages.** With RabbitMQ down, ingest's own trace shows a failed span for the publish call. With notifier down, the workflow's `InvokeMethod` activity gets an error span. Tempo becomes the "what happened at t=X?" tool of choice.
+- **Dapr resiliency policies were not exercised.** We use Dapr defaults everywhere. Configuring `resiliency.yaml` with retry/circuit-breaker specs might have prevented the RabbitMQ ingest loss. **Follow-up worth adding to the demo before showing it externally.**
+
+### Pros
+
+- **Workflow durability really works** (chaos-4, chaos-5). State in Redis + actor rescheduling means workflows survive pod restarts and control-plane restarts. This is the Dapr Workflows pitch made concrete.
+- **Service invocation failures are self-healing when the failure window is bounded.** Chaos-1 showed the workflow just... waited, and the next scheduled activity hit the recovered service.
+- **Kubernetes-native restart semantics apply.** Deleting a pod, killing a StatefulSet member — all standard K8s operations. Dapr doesn't add new operational primitives; the ops team's existing runbooks apply.
+- **Everything scripted and re-runnable.** `make chaos-N` is repeatable; each snapshot captures before/during/after. Good for regression once we fix the RabbitMQ gap.
+
+### Cons
+
+- **Publisher-side pub/sub failures are silent and lossy** (chaos-3). Real production impact if we don't add publisher retries or an outbox. **This is the honest #1 concern.**
+- **Sidecar-only failure modes are hard to test.** Distroless image = no exec-based kill. In production you'd use `kubectl debug` or a service-mesh fault-injection tool. Not a Dapr fault, but a real testability cost.
+- **Resiliency policies exist but aren't wired.** We have Dapr's defaults which are conservative-to-nothing. The demo would be more honest with an explicit `resiliency.yaml` showing what's configured.
+- **KinD masks slow-recovery scenarios.** Cannot make strong claims about "Dapr recovers in Xs" from this demo; need production-shaped follow-up testing.
+
+### Gotchas
+
+- **`kubectl exec -c daprd -- /bin/sh` fails silently** — daprd's distroless image has no shell. My first attempt at "kill only the sidecar" appeared to succeed but did nothing. Only noticed because the `restarts=0` counter wasn't incrementing. **Always verify the kill happened by checking restart count or pod name.**
+- **KinD placement label is `app=dapr-placement-server`** (not `app.kubernetes.io/name=...` as I tried first). Chart-managed selectors are inconsistent across Dapr control-plane pods; check `kubectl get pod -o jsonpath='{.metadata.labels}'` per pod family before writing chaos scripts.
+- **Postgres `/stats` calls didn't touch Postgres.** Our observation approach missed the actual state-store impact because we hit in-memory endpoints. Any chaos observation needs to *actively drive traffic on the affected path*, not just poll `/stats`.
+- **Workflow-index reads during Postgres outage would fail.** Not tested here, but the T11.5 workflow inbox depends on Postgres. Chaos-2 didn't hit `/workflows` during the outage window — worth adding.
+
+### Overhead
+
+- Chaos targets total: ~200 lines of Makefile (heavy shell — one target per scenario + `chaos-observe` + `chaos-traffic` + `chaos-clean`).
+- Full T15 run time: ~7 minutes for all five scenarios sequentially. Individual scenarios are ~60-90s each.
+- No new services, no new components, no new state. Reuses existing observation surface (Grafana, Tempo, app `/stats` endpoints).
+
+### Meta
+
+- **The chaos slice is where the "honest cost" side of the pitch lives.** Most Dapr demos skip this because "everything worked!" is a boring demo. But the RabbitMQ finding (silent publisher loss) is *the most important thing this whole demo taught us*. If we present the demo without this slice, someone in the audience will (correctly) ask "what happens when the broker goes down?" and we'll answer with hand-waving. With this slice, we answer with numbers.
+- **For the talk:** the demo money-shot from chaos is scenario 4 (workflow survives pod restart). The talk cost is scenario 3 (RabbitMQ loses publishes silently). Show both. The audience trusts you more when you show both.
+- **Follow-ups worth an ADR:**
+  1. Publisher retry / outbox for at-least-once ingest (chaos-3 gap).
+  2. Dapr resiliency policies — pick a set of retry/circuit-breaker configurations and test them against these scenarios.
+  3. Redesign chaos-2 to actively stress state-store paths during the outage window.
+  4. Repeat all five scenarios on a production-shaped cluster (not KinD) to get real recovery-time numbers.
+- Ready for T16 (sidecar overhead measurement) — the last honest-cost slice.

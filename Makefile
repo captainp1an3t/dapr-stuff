@@ -357,6 +357,217 @@ anomaly-demo: ## Seed today's data with a 4x spike on team-payments/ec2 and trig
 	  echo "  rollup-svc /stats:"; \
 	  curl -sS http://localhost:8081/stats | python3 -m json.tool | sed 's/^/    /'
 
+## ---- T15 chaos targets ---------------------------------------------------
+## Each `chaos-N` runs one focused scenario: pre-position in-flight state,
+## snapshot, kill the target, observe, try to complete the pre-positioned
+## work, print a summary. Reuse observation targets (chaos-observe) between
+## and after each scenario.
+##
+## Run `chaos-traffic` in a separate terminal for light continuous load,
+## then run scenarios one at a time in your main shell. Kill the traffic
+## generator (Ctrl-C) when done.
+
+.PHONY: chaos-traffic
+chaos-traffic: ## T15 light continuous load — 1 ingest/5s + 1 workflow/30s (blocks; Ctrl-C to stop)
+	@echo "chaos-traffic: emitting synthetic ingest + workflow starts. Ctrl-C to stop."
+	@i=0; \
+	while true; do \
+	  i=$$((i+1)); \
+	  day=$$(date +%Y-%m-%d); \
+	  python3 data/generator/generate.py --day $$day --count 5 --seed $$((7000+i)) --url http://localhost:8080/ingest >/dev/null 2>&1 || echo "  [t$$i] ingest failed"; \
+	  if [ $$((i % 6)) -eq 0 ]; then \
+	    ts=$$(date +%H%M%S); \
+	    curl -sS -X POST -H 'Content-Type: application/json' \
+	      -d "{\"day\":\"$$day\",\"team_id\":\"team-traffic-$$ts\",\"team_name\":\"Traffic $$ts\",\"service\":\"ec2\",\"actual_cost_usd\":1000,\"baseline_cost_usd\":100,\"delta_pct\":900}" \
+	      http://localhost:8082/triage >/dev/null 2>&1 && \
+	      echo "  [t$$i] started triage workflow team-traffic-$$ts" || \
+	      echo "  [t$$i] triage schedule failed"; \
+	  fi; \
+	  sleep 5; \
+	done
+
+.PHONY: chaos-observe
+chaos-observe: ## T15 snapshot: pod status, workflow inbox, notifier inbox, decision counts
+	@ts=$$(date -u +%H:%M:%SZ); \
+	echo "== chaos-observe @ $$ts =="; \
+	echo "-- pods --"; \
+	kubectl --context $(KUBE_CTX) get pod -A -l 'app in (ingest-svc,rollup-svc,triage-svc,notifier-svc,postgres,redis,rabbitmq)' --no-headers 2>/dev/null | awk '{printf "  %-30s %-10s restarts=%s age=%s\n", $$2, $$4, $$5, $$6}'; \
+	echo "  dapr control plane:"; \
+	kubectl --context $(KUBE_CTX) get pod -n dapr-system --no-headers 2>/dev/null | awk '{printf "    %-30s %-10s restarts=%s\n", $$1, $$3, $$4}'; \
+	echo "-- app stats --"; \
+	for port in 8080 8081 8082 8083; do \
+	  case $$port in 8080) svc="ingest";; 8081) svc="rollup";; 8082) svc="triage";; 8083) svc="notifier";; esac; \
+	  resp=$$(curl -sS --max-time 2 http://localhost:$$port/stats 2>/dev/null); \
+	  if [ -n "$$resp" ]; then \
+	    echo "  $$svc: $$resp"; \
+	  else \
+	    echo "  $$svc: UNREACHABLE"; \
+	  fi; \
+	done; \
+	echo "-- workflow inbox --"; \
+	inbox=$$(curl -sS --max-time 2 http://localhost:8082/workflows 2>/dev/null); \
+	if [ -n "$$inbox" ]; then \
+	  echo "$$inbox" | python3 -c 'import sys,json; from collections import Counter; d=json.load(sys.stdin); c=Counter(w["status_name"] for w in d["workflows"]); print("  total=" + str(d["count"]) + "  " + "  ".join(k+"="+str(v) for k,v in c.items()))' 2>/dev/null || echo "  (parse error)"; \
+	else \
+	  echo "  triage-svc UNREACHABLE"; \
+	fi
+
+.PHONY: chaos-clean
+chaos-clean: ## T15 clean up in-flight test workflows and reset counters (best-effort)
+	@echo "chaos-clean: no-op today — Dapr Workflows persist by design."
+	@echo "  If you need a clean slate, restart the cluster: make down && make up"
+
+.PHONY: chaos-1
+chaos-1: ## T15 scenario 1: kill notifier-svc while triage workflow is escalating
+	@echo "== chaos-1: kill notifier-svc during escalation =="
+	@echo "-- before --"; $(MAKE) chaos-observe --no-print-directory
+	@echo "-- pre-position: start a triage workflow that will escalate --"
+	@ts=$$(date +%s); \
+	curl -sS -X POST -H 'Content-Type: application/json' \
+	  -d "{\"day\":\"2026-07-05\",\"team_id\":\"team-chaos1-$$ts\",\"team_name\":\"Chaos1 $$ts\",\"service\":\"ec2\",\"actual_cost_usd\":9999,\"baseline_cost_usd\":100,\"delta_pct\":9899}" \
+	  http://localhost:8082/triage; \
+	  echo; \
+	  echo "  workflow started; waiting 5s for it to send initial notify..."; \
+	  sleep 5; \
+	  echo "-- kill notifier-svc --"; \
+	  kubectl --context $(KUBE_CTX) delete pod -l app=notifier-svc --wait=false; \
+	  echo "-- observe every 10s for 60s while notifier is gone/restarting --"; \
+	  for i in 1 2 3 4 5 6; do \
+	    sleep 10; \
+	    printf "  t+%02ds " $$((i*10)); \
+	    n=$$(curl -sS --max-time 2 http://localhost:8083/stats 2>/dev/null); \
+	    if [ -n "$$n" ]; then \
+	      echo "notifier: $$n"; \
+	    else \
+	      echo "notifier: UNREACHABLE"; \
+	    fi; \
+	  done; \
+	  echo "-- final state of chaos1 workflow --"; \
+	  curl -sS http://localhost:8082/workflows/triage-anomaly-2026-07-05-team-chaos1-$$ts-ec2 | python3 -m json.tool | sed 's/^/  /'
+
+.PHONY: chaos-2
+chaos-2: ## T15 scenario 2: kill Postgres and observe state-dependent services
+	@echo "== chaos-2: kill Postgres =="
+	@echo "-- before --"; $(MAKE) chaos-observe --no-print-directory
+	@echo "-- kill Postgres --"; kubectl --context $(KUBE_CTX) delete pod -n data -l app=postgres --wait=false
+	@echo "-- observe every 10s for 60s (state-store calls should fail while Postgres restarts) --"
+	@for i in 1 2 3 4 5 6; do \
+	  sleep 10; \
+	  printf "  t+%02ds " $$((i*10)); \
+	  pg=$$(kubectl --context $(KUBE_CTX) get pod -n data -l app=postgres --no-headers 2>/dev/null | awk '{print $$3}'); \
+	  echo "postgres: $$pg"; \
+	  echo "    trying rollup /stats:"; \
+	  resp=$$(curl -sS --max-time 2 http://localhost:8081/stats 2>/dev/null); \
+	  echo "      $${resp:-UNREACHABLE}"; \
+	done
+	@echo "-- try a fresh workflow post-recovery --"
+	@ts=$$(date +%s); \
+	curl -sS -X POST -H 'Content-Type: application/json' \
+	  -d "{\"day\":\"2026-07-05\",\"team_id\":\"team-chaos2-$$ts\",\"team_name\":\"Chaos2 $$ts\",\"service\":\"ec2\",\"actual_cost_usd\":500,\"baseline_cost_usd\":50,\"delta_pct\":900}" \
+	  http://localhost:8082/triage; echo
+
+.PHONY: chaos-3
+chaos-3: ## T15 scenario 3: kill RabbitMQ and observe pubsub behaviour
+	@echo "== chaos-3: kill RabbitMQ =="
+	@echo "-- before --"; $(MAKE) chaos-observe --no-print-directory
+	@echo "-- ingest 20 line items just before kill (some may be in-flight) --"
+	@python3 data/generator/generate.py --day $$(date +%Y-%m-%d) --count 20 --seed 30001 --url http://localhost:8080/ingest 2>&1 | tail -1
+	@echo "-- kill RabbitMQ --"; kubectl --context $(KUBE_CTX) delete pod -n data -l app=rabbitmq --wait=false
+	@echo "-- observe every 10s for 60s (publish should fail; subscriber redelivery on recovery) --"
+	@for i in 1 2 3 4 5 6; do \
+	  sleep 10; \
+	  printf "  t+%02ds " $$((i*10)); \
+	  rmq=$$(kubectl --context $(KUBE_CTX) get pod -n data -l app=rabbitmq --no-headers 2>/dev/null | awk '{print $$3}'); \
+	  echo "rabbitmq: $$rmq"; \
+	  ingest=$$(curl -sS --max-time 2 http://localhost:8080/stats 2>/dev/null); \
+	  rollup=$$(curl -sS --max-time 2 http://localhost:8081/stats 2>/dev/null); \
+	  echo "    ingest:  $${ingest:-UNREACHABLE}"; \
+	  echo "    rollup:  $${rollup:-UNREACHABLE}"; \
+	done
+	@echo "-- post-recovery: try another ingest --"
+	@python3 data/generator/generate.py --day $$(date +%Y-%m-%d) --count 5 --seed 30002 --url http://localhost:8080/ingest 2>&1 | tail -1
+
+.PHONY: chaos-4
+chaos-4: ## T15 scenario 4: kill triage-svc pod (app + sidecar together) while workflow is suspended in ack-wait
+	@echo "== chaos-4: kill triage-svc pod (app + daprd sidecar together) =="
+	@echo "NOTE: daprd's distroless image has no shell, so we can't kill only the sidecar"
+	@echo "      from inside the pod. Deleting the whole pod is the realistic production case"
+	@echo "      (OOM kill, rolling update, node drain)."
+	@echo "-- before --"; $(MAKE) chaos-observe --no-print-directory
+	@echo "-- pre-position: start a workflow that will suspend in ack-wait --"
+	@ts=$$(date +%s); \
+	instance_id="triage-anomaly-2026-07-05-team-chaos4-$$ts-ec2"; \
+	echo "$$instance_id" > /tmp/chaos4-id; \
+	curl -sS -X POST -H 'Content-Type: application/json' \
+	  -d "{\"day\":\"2026-07-05\",\"team_id\":\"team-chaos4-$$ts\",\"team_name\":\"Chaos4 $$ts\",\"service\":\"ec2\",\"actual_cost_usd\":5000,\"baseline_cost_usd\":100,\"delta_pct\":4900}" \
+	  http://localhost:8082/triage; \
+	  echo; \
+	  echo "  instance: $$instance_id"; \
+	  echo "  waiting 5s for initial notify to complete and workflow to enter ack-wait..."; \
+	  sleep 5
+	@echo "-- kill triage-svc pod (both containers) --"
+	@kubectl --context $(KUBE_CTX) delete pod -l app=triage-svc --wait=false
+	@echo "-- observe every 10s for 60s (pod restarts; workflow state in Redis should survive) --"
+	@for i in 1 2 3 4 5 6; do \
+	  sleep 10; \
+	  printf "  t+%02ds " $$((i*10)); \
+	  pod=$$(kubectl --context $(KUBE_CTX) get pod -l app=triage-svc --no-headers 2>/dev/null | awk '{print $$2, $$3, "restarts="$$4, "age="$$5}'); \
+	  echo "triage-svc pod: $$pod"; \
+	  meta=$$(curl -sS --max-time 3 http://localhost:8082/workflows/$$(cat /tmp/chaos4-id) 2>/dev/null); \
+	  if [ -n "$$meta" ]; then \
+	    st=$$(echo "$$meta" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("status", "?"))' 2>/dev/null); \
+	    echo "    chaos4 workflow status: $$st"; \
+	  else \
+	    echo "    chaos4 workflow: triage-svc UNREACHABLE"; \
+	  fi; \
+	done
+	@echo "-- try to ack the pre-positioned workflow --"
+	@id=$$(cat /tmp/chaos4-id); \
+	  echo "  raising ack on $$id"; \
+	  curl -sS -X POST -H 'Content-Type: application/json' -d '{"acked_by":"chaos4"}' http://localhost:8082/workflows/$$id/ack; \
+	  echo; \
+	  sleep 3; \
+	  echo "  final state:"; \
+	  curl -sS http://localhost:8082/workflows/$$id | python3 -m json.tool | sed 's/^/    /'
+
+.PHONY: chaos-5
+chaos-5: ## T15 scenario 5: kill Dapr placement service — the control-plane worst case
+	@echo "== chaos-5: kill Dapr placement =="
+	@echo "-- before --"; $(MAKE) chaos-observe --no-print-directory
+	@echo "-- pre-position: start a workflow that will suspend in ack-wait --"
+	@ts=$$(date +%s); \
+	instance_id="triage-anomaly-2026-07-05-team-chaos5-$$ts-ec2"; \
+	echo "$$instance_id" > /tmp/chaos5-id; \
+	curl -sS -X POST -H 'Content-Type: application/json' \
+	  -d "{\"day\":\"2026-07-05\",\"team_id\":\"team-chaos5-$$ts\",\"team_name\":\"Chaos5 $$ts\",\"service\":\"ec2\",\"actual_cost_usd\":5000,\"baseline_cost_usd\":100,\"delta_pct\":4900}" \
+	  http://localhost:8082/triage; \
+	  echo; \
+	  echo "  instance: $$instance_id"; \
+	  sleep 5
+	@echo "-- kill Dapr placement pod --"
+	@kubectl --context $(KUBE_CTX) delete pod -n dapr-system -l app=dapr-placement-server --wait=false
+	@echo "-- observe every 10s for 90s (workflow actors may be unroutable while placement is down) --"
+	@for i in 1 2 3 4 5 6 7 8 9; do \
+	  sleep 10; \
+	  printf "  t+%02ds " $$((i*10)); \
+	  pl=$$(kubectl --context $(KUBE_CTX) get pod -n dapr-system -l app=dapr-placement-server --no-headers 2>/dev/null | head -1 | awk '{print $$3, "restarts="$$4}'); \
+	  echo "placement: $$pl"; \
+	  meta=$$(curl -sS --max-time 3 http://localhost:8082/workflows/$$(cat /tmp/chaos5-id) 2>/dev/null); \
+	  if [ -n "$$meta" ]; then \
+	    st=$$(echo "$$meta" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("status", "?"))' 2>/dev/null); \
+	    echo "    chaos5 workflow status: $$st"; \
+	  else \
+	    echo "    chaos5 workflow: UNREACHABLE"; \
+	  fi; \
+	done
+	@echo "-- try to ack the pre-positioned workflow after placement recovery --"
+	@id=$$(cat /tmp/chaos5-id); \
+	  curl -sS -X POST -H 'Content-Type: application/json' -d '{"acked_by":"chaos5"}' http://localhost:8082/workflows/$$id/ack; \
+	  echo; \
+	  sleep 5; \
+	  echo "  final state:"; \
+	  curl -sS http://localhost:8082/workflows/$$id | python3 -m json.tool | sed 's/^/    /'
+
 ## ---- Cluster lifecycle ----------------------------------------------------
 
 .PHONY: cluster-ensure

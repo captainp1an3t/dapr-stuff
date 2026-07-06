@@ -339,7 +339,7 @@ Reuses the notifier and the HTMX pattern from T12/T13.
 
 ---
 
-## - [ ] T15: Chaos — kill things, observe recovery
+## - [x] T15: Chaos — kill things, observe recovery
 
 **Type**: AFK
 **Blocked by**: T14 (or any point after T12 where the full stack is meaningful)
