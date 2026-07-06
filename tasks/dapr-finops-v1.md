@@ -319,7 +319,7 @@ TDD focus: the workflow's decision logic (ack path vs. timeout path) using the D
 
 ---
 
-## - [ ] T14: Optimisation approval workflow (bonus)
+## - [x] T14: Optimisation approval workflow (bonus)
 
 **Type**: AFK
 **Blocked by**: T12

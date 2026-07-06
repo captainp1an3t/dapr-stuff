@@ -115,18 +115,35 @@ def inbox():
 def notify():
     _stats["received"] += 1
     body = request.get_json(force=True, silent=True) or {}
-    anomaly = body.get("anomaly") or {}
     kind = body.get("kind", "initial")
 
-    payload = build_slack_payload(anomaly, kind)
-    entry = {
-        "sent_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "kind": kind,
-        "anomaly_id": (
+    # Polymorphic payload: {kind, anomaly} for T12 triage flow,
+    # {kind, optimisation} for T14 optimisation flow. One /notify endpoint
+    # so the abstraction at the workflow-activity level stays uniform;
+    # discriminate here on payload shape rather than on kind. If kind and
+    # payload shape ever conflict, payload shape wins.
+    optimisation = body.get("optimisation") or {}
+    anomaly = body.get("anomaly") or {}
+
+    if optimisation:
+        payload = build_optimisation_payload(optimisation, kind)
+        subject_id = (
+            f"{optimisation.get('team_id', '?')}:"
+            f"{optimisation.get('resource_id', '?')}:"
+            f"{optimisation.get('suggested_action', '?')}"
+        )
+    else:
+        payload = build_slack_payload(anomaly, kind)
+        subject_id = (
             f"{anomaly.get('day', '?')}:"
             f"{anomaly.get('team_id', '?')}:"
             f"{anomaly.get('service', '?')}"
-        ),
+        )
+
+    entry = {
+        "sent_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "kind": kind,
+        "anomaly_id": subject_id,  # kept as field name for backwards compat
         "payload_text": payload.get("text"),
     }
 
@@ -193,6 +210,46 @@ def build_slack_payload(anomaly: dict[str, Any], kind: str) -> dict[str, Any]:
                     {"title": "Delta", "value": f"{delta_pct:+.0f}%", "short": True},
                     {"title": "Actual", "value": f"${actual:,.2f}", "short": True},
                     {"title": "Baseline", "value": f"${baseline:,.2f}", "short": True},
+                ],
+            }
+        ],
+    }
+
+
+def build_optimisation_payload(optimisation: dict[str, Any], kind: str) -> dict[str, Any]:
+    """Render a Slack-compatible message from an IdleResource dict.
+
+    `kind` for T14 is currently just "optimisation-request" — approval and
+    rejection outcomes are recorded to state, not re-notified. If we later
+    want confirmation pings, add "optimisation-approved" / "-rejected".
+    """
+    team = optimisation.get("team_name") or optimisation.get("team_id") or "unknown"
+    service = optimisation.get("service", "?")
+    resource_id = optimisation.get("resource_id", "?")
+    resource_type = optimisation.get("resource_type", "resource")
+    action = optimisation.get("suggested_action", "review")
+    waste = float(optimisation.get("monthly_waste_usd", 0))
+    days = int(optimisation.get("days_idle", 0))
+
+    text = (
+        f"[OPTIMISATION] *{team}* — {resource_type} `{resource_id}` on `{service}` "
+        f"has been idle {days} days (~${waste:,.2f}/month waste). "
+        f"Suggested action: *{action}*."
+    )
+
+    return {
+        "text": text,
+        "attachments": [
+            {
+                "color": "good",  # blue-ish informational, not an alarm
+                "fields": [
+                    {"title": "Team", "value": team, "short": True},
+                    {"title": "Service", "value": service, "short": True},
+                    {"title": "Resource", "value": f"{resource_type} {resource_id}", "short": False},
+                    {"title": "Idle for", "value": f"{days} days", "short": True},
+                    {"title": "Monthly waste", "value": f"${waste:,.2f}", "short": True},
+                    {"title": "Suggested action", "value": action, "short": True},
+                    {"title": "Kind", "value": kind, "short": True},
                 ],
             }
         ],

@@ -27,8 +27,11 @@ const (
 	notifierAppID           = "notifier-svc"
 	notifyMethod            = "notify"
 	ackEventName            = "ack"
+	decisionEventName       = "decision"
 	defaultAckTimeoutSecs   = 30
 	defaultMaxEscalations   = 2
+	defaultDecisionTimeoutSecs = 30
+	decisionStateKeyPrefix  = "optimisation-decision:"
 )
 
 // activityDaprClient is set in main() and used by activity functions, which
@@ -190,6 +193,183 @@ func NotifyOwnerActivity(ctx workflow.ActivityContext) (any, error) {
 	return map[string]string{"delivered": in.Kind}, nil
 }
 
+// ---- T14 optimisation workflow ---------------------------------------------
+//
+// Second workflow, deliberately different shape from Triage so we can honestly
+// answer "what was reusable?". Same overall structure (schedule → notify →
+// wait → terminate), different domain type (IdleResource), different external
+// events (approve/reject instead of ack), different terminal states (approved
+// / rejected / expired), and it *persists a decision record to state store*
+// which the triage flow does not.
+
+// notifyOptimisationInput mirrors notifyInput but carries an IdleResource
+// and is discriminated at the notifier by payload key ("optimisation" vs
+// "anomaly"). Two structs rather than one polymorphic one keeps each
+// activity honest about what it expects.
+type notifyOptimisationInput struct {
+	Kind         string              `json:"kind"`
+	Optimisation finops.IdleResource `json:"optimisation"`
+}
+
+// decisionEvent is the payload for the "decision" external event. The
+// caller sets `Decision` to either "approve" or "reject" (typically via
+// the /workflows/{id}/approve or .../reject HTTP routes, which inject the
+// value server-side). Same shape either way; the workflow branches on the
+// Decision field. One event is simpler than racing two — durabletask-go
+// v0.5.0 has no WhenAny, so sequential Awaits would block full timeouts.
+type decisionEvent struct {
+	Decision  string `json:"decision"` // "approve" | "reject"
+	DecidedBy string `json:"decided_by"`
+	Note      string `json:"note,omitempty"`
+}
+
+// decisionRecord is what we persist to state-postgres so the decision
+// survives workflow purge. Keyed by IdleResource.ID().
+type decisionRecord struct {
+	ResourceID      string  `json:"resource_id"`
+	TeamID          string  `json:"team_id"`
+	SuggestedAction string  `json:"suggested_action"`
+	Decision        string  `json:"decision"` // "approved" | "rejected" | "expired"
+	DecidedBy       string  `json:"decided_by"`
+	Note            string  `json:"note,omitempty"`
+	DecidedAt       string  `json:"decided_at"`
+	MonthlyWasteUSD float64 `json:"monthly_waste_usd"`
+}
+
+// OptimisationWorkflow — T14 second workflow.
+//
+// Shape:
+//   1. NotifyOptimisationActivity (kind=optimisation-request)
+//   2. WaitForExternalEvent("decision", timeout) — one event, discriminated
+//      by the Decision field. The two HTTP routes /approve and /reject
+//      inject the value server-side so callers get the RESTful URL they
+//      expect, but the workflow only waits on one thing.
+//   3. On decision, RecordDecisionActivity persists the outcome to state.
+//   4. On timeout, the outcome is "expired" (no destructive action —
+//      conservative default).
+//
+// DELIBERATE choice: no escalation loop. Approve/reject is binary —
+// nagging someone repeatedly to make a destructive-vs-safe decision
+// doesn't scale as a UX. Contrast with TriageWorkflow which escalates.
+func OptimisationWorkflow(ctx *workflow.WorkflowContext) (any, error) {
+	var res finops.IdleResource
+	if err := ctx.GetInput(&res); err != nil {
+		return nil, err
+	}
+
+	timeout := decisionTimeout()
+	log.Printf("workflow: optimisation %s (timeout=%s)", res.ID(), timeout)
+
+	if err := ctx.CallActivity(NotifyOptimisationActivity,
+		workflow.ActivityInput(notifyOptimisationInput{
+			Kind: "optimisation-request", Optimisation: res,
+		}),
+	).Await(nil); err != nil {
+		return nil, fmt.Errorf("optimisation notify failed: %w", err)
+	}
+
+	var evt decisionEvent
+	err := ctx.WaitForExternalEvent(decisionEventName, timeout).Await(&evt)
+
+	decision := decisionRecord{
+		ResourceID:      res.ResourceID,
+		TeamID:          res.TeamID,
+		SuggestedAction: res.SuggestedAction,
+		MonthlyWasteUSD: res.MonthlyWasteUSD,
+		DecidedAt:       ctx.CurrentUTCDateTime().UTC().Format(time.RFC3339),
+	}
+
+	switch {
+	case err == nil && evt.Decision == "approve":
+		decision.Decision = "approved"
+		decision.DecidedBy = evt.DecidedBy
+		decision.Note = evt.Note
+	case err == nil && evt.Decision == "reject":
+		decision.Decision = "rejected"
+		decision.DecidedBy = evt.DecidedBy
+		decision.Note = evt.Note
+	case errors.Is(err, task.ErrTaskCanceled):
+		decision.Decision = "expired"
+		decision.DecidedBy = "system"
+		decision.Note = "no decision received within timeout"
+	default:
+		return nil, fmt.Errorf("wait for decision failed: %w (evt=%+v)", err, evt)
+	}
+
+	// Persist the decision record. Non-fatal if it fails — we still complete
+	// the workflow (the outcome is in the workflow output either way).
+	if err := ctx.CallActivity(RecordDecisionActivity,
+		workflow.ActivityInput(decision),
+	).Await(nil); err != nil {
+		log.Printf("WARN: RecordDecisionActivity failed for %s: %v", res.ID(), err)
+	}
+
+	return decision, nil
+}
+
+// NotifyOptimisationActivity — same shape as NotifyOwnerActivity but with
+// a different payload discriminator. The notifier-svc /notify endpoint
+// dispatches on payload shape.
+func NotifyOptimisationActivity(ctx workflow.ActivityContext) (any, error) {
+	var in notifyOptimisationInput
+	if err := ctx.GetInput(&in); err != nil {
+		return nil, err
+	}
+
+	body, err := json.Marshal(in)
+	if err != nil {
+		return nil, err
+	}
+
+	content := &daprd.DataContent{
+		ContentType: "application/json",
+		Data:        body,
+	}
+
+	_, err = activityDaprClient.InvokeMethodWithContent(ctx.Context(),
+		notifierAppID, notifyMethod, "POST", content)
+	if err != nil {
+		return nil, fmt.Errorf("invoke %s.%s: %w", notifierAppID, notifyMethod, err)
+	}
+
+	log.Printf("activity: notified optimisation %s kind=%s", in.Optimisation.ID(), in.Kind)
+	return map[string]string{"delivered": in.Kind}, nil
+}
+
+// RecordDecisionActivity writes the decision to state-postgres under a
+// deterministic key so it can be queried after the workflow is purged.
+// Idempotent: re-runs overwrite the same key with the same content.
+func RecordDecisionActivity(ctx workflow.ActivityContext) (any, error) {
+	var d decisionRecord
+	if err := ctx.GetInput(&d); err != nil {
+		return nil, err
+	}
+
+	body, err := json.Marshal(d)
+	if err != nil {
+		return nil, err
+	}
+
+	key := decisionStateKeyPrefix + d.ResourceID
+	if err := activityDaprClient.SaveState(ctx.Context(), stateStore, key, body, nil); err != nil {
+		return nil, fmt.Errorf("save decision %s: %w", key, err)
+	}
+
+	log.Printf("activity: recorded decision %s = %s by %s", d.ResourceID, d.Decision, d.DecidedBy)
+	return map[string]string{"recorded": d.Decision}, nil
+}
+
+func decisionTimeout() time.Duration {
+	if v := os.Getenv("DECISION_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return time.Duration(defaultDecisionTimeoutSecs) * time.Second
+}
+
+// ---- end T14 ---------------------------------------------------------------
+
 func ackTimeout() time.Duration {
 	if v := os.Getenv("ACK_TIMEOUT_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -219,14 +399,23 @@ func main() {
 	if err := worker.RegisterWorkflow(TriageWorkflow); err != nil {
 		log.Fatalf("register workflow: %v", err)
 	}
+	if err := worker.RegisterWorkflow(OptimisationWorkflow); err != nil {
+		log.Fatalf("register optimisation workflow: %v", err)
+	}
 	if err := worker.RegisterActivity(NotifyOwnerActivity); err != nil {
 		log.Fatalf("register activity: %v", err)
+	}
+	if err := worker.RegisterActivity(NotifyOptimisationActivity); err != nil {
+		log.Fatalf("register optimisation notify activity: %v", err)
+	}
+	if err := worker.RegisterActivity(RecordDecisionActivity); err != nil {
+		log.Fatalf("register record-decision activity: %v", err)
 	}
 	if err := worker.Start(); err != nil {
 		log.Fatalf("start worker: %v", err)
 	}
 	defer worker.Shutdown()
-	log.Printf("workflow worker started, TriageWorkflow + NotifyOwnerActivity registered")
+	log.Printf("workflow worker started; TriageWorkflow + OptimisationWorkflow + 3 activities registered")
 
 	// --- Workflow client: schedules workflow instances.
 	wfClient, err := workflow.NewClient()
@@ -251,6 +440,8 @@ func main() {
 	mux.HandleFunc("/stats", handleStats(s))
 	mux.HandleFunc("/events/anomaly-detected", handleAnomalyDetected(ctx, wfClient, dc, s))
 	mux.HandleFunc("/triage", handleTriageStart(ctx, wfClient, dc, s))
+	mux.HandleFunc("/optimisation", handleOptimisationStart(ctx, wfClient, dc, s))
+	mux.HandleFunc("/optimisations", handleOptimisationList(ctx, wfClient, dc))
 	mux.HandleFunc("/workflows", handleWorkflowInbox(ctx, wfClient, dc))
 	mux.HandleFunc("/workflows/", handleWorkflowRouter(ctx, wfClient))
 
@@ -403,14 +594,152 @@ func handleTriageStart(
 	}
 }
 
-// handleWorkflowRouter dispatches /workflows/{id}, /workflows/{id}/ack, and
-// /workflows/{id}/page based on suffix. Kept in one handler because Go's
-// stdlib mux doesn't do path parameters.
+// handleOptimisationStart — POST /optimisation kicks off an OptimisationWorkflow.
+// Same shape as handleTriageStart but takes an IdleResource. The two handlers
+// are essentially clones; the amount of duplicated boilerplate is one of the
+// honest observations in NOTES.md T14 — Dapr's abstraction is at the workflow
+// level, not at the "kick off any workflow" level. A generic dispatcher would
+// require reflection or code-gen.
+func handleOptimisationStart(
+	ctx context.Context,
+	wfClient *workflow.Client,
+	dc daprd.Client,
+	s *stats,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		s.Received.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+
+		var res finops.IdleResource
+		if err := json.NewDecoder(r.Body).Decode(&res); err != nil {
+			s.BadEnv.Add(1)
+			http.Error(w, "bad JSON: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		instanceID := optimisationInstanceID(res)
+		_, err := wfClient.ScheduleNewWorkflow(ctx, "OptimisationWorkflow",
+			workflow.WithInstanceID(instanceID),
+			workflow.WithInput(res),
+		)
+		if err != nil {
+			if isDuplicateInstance(err) {
+				s.Duplicate.Add(1)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"instance_id": instanceID,
+					"status":      "duplicate",
+				})
+				return
+			}
+			s.Failed.Add(1)
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		s.Started.Add(1)
+		if err := appendToWorkflowIndex(ctx, dc, instanceID); err != nil {
+			log.Printf("WARN: workflow-index update failed for %s: %v", instanceID, err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"instance_id": instanceID,
+			"status":      "started",
+		})
+	}
+}
+
+// handleOptimisationList — GET /optimisations reads the workflow index,
+// filters to OptimisationWorkflow instances, and returns a summary list
+// including the recorded decision (if any) pulled from state-postgres.
+// Same shape as handleWorkflowInbox but pre-filtered by workflow type.
+func handleOptimisationList(ctx context.Context, wfClient *workflow.Client, dc daprd.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		ids, _, err := readWorkflowIndex(ctx, dc)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+
+		type summary struct {
+			InstanceID    string `json:"instance_id"`
+			Status        int32  `json:"status"`
+			StatusName    string `json:"status_name"`
+			CreatedAt     string `json:"created_at"`
+			LastUpdatedAt string `json:"last_updated_at"`
+			ResourceID    string `json:"resource_id,omitempty"`
+			TeamID        string `json:"team_id,omitempty"`
+			Decision      string `json:"decision,omitempty"`
+			DecidedBy     string `json:"decided_by,omitempty"`
+		}
+
+		out := make([]summary, 0)
+		for _, id := range ids {
+			// Cheap prefix filter first; avoids fetching TriageWorkflow metadata.
+			if !strings.HasPrefix(id, "opt-") {
+				continue
+			}
+			meta, err := wfClient.FetchWorkflowMetadata(ctx, id, workflow.WithFetchPayloads(true))
+			if err != nil {
+				continue
+			}
+
+			s := summary{
+				InstanceID:    meta.InstanceID,
+				Status:        int32(meta.RuntimeStatus),
+				StatusName:    meta.RuntimeStatus.String(),
+				CreatedAt:     meta.CreatedAt.Format(time.RFC3339),
+				LastUpdatedAt: meta.LastUpdatedAt.Format(time.RFC3339),
+			}
+			// Best-effort resource_id + team from the input payload.
+			if meta.SerializedInput != "" {
+				var res finops.IdleResource
+				if err := json.Unmarshal([]byte(meta.SerializedInput), &res); err == nil {
+					s.ResourceID = res.ResourceID
+					s.TeamID = res.TeamID
+					// Best-effort decision pull from state store.
+					if dec, ok := readDecision(ctx, dc, res.ResourceID); ok {
+						s.Decision = dec.Decision
+						s.DecidedBy = dec.DecidedBy
+					}
+				}
+			}
+			out = append(out, s)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"count":         len(out),
+			"optimisations": out,
+		})
+	}
+}
+
+// readDecision is a best-effort lookup of the persisted decision record.
+// Returns (record, true) on hit, (empty, false) on miss or error. Not
+// on the workflow's critical path — used by the list view.
+func readDecision(ctx context.Context, dc daprd.Client, resourceID string) (decisionRecord, bool) {
+	item, err := dc.GetState(ctx, stateStore, decisionStateKeyPrefix+resourceID, nil)
+	if err != nil || item == nil || len(item.Value) == 0 {
+		return decisionRecord{}, false
+	}
+	var d decisionRecord
+	if err := json.Unmarshal(item.Value, &d); err != nil {
+		return decisionRecord{}, false
+	}
+	return d, true
+}
+
+// handleWorkflowRouter dispatches /workflows/{id}, /workflows/{id}/ack,
+// /workflows/{id}/approve, /workflows/{id}/reject, and /workflows/{id}/page
+// based on suffix. Kept in one handler because Go's stdlib mux doesn't do
+// path parameters.
 func handleWorkflowRouter(ctx context.Context, wfClient *workflow.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rest := strings.TrimPrefix(r.URL.Path, "/workflows/")
 		if rest == "" {
-			http.Error(w, "expected /workflows/{instance-id}[/ack|/page]", http.StatusBadRequest)
+			http.Error(w, "expected /workflows/{instance-id}[/ack|/approve|/reject|/page]", http.StatusBadRequest)
 			return
 		}
 		parts := strings.SplitN(rest, "/", 2)
@@ -424,7 +753,11 @@ func handleWorkflowRouter(ctx context.Context, wfClient *workflow.Client) http.H
 		case "":
 			handleWorkflowQuery(ctx, wfClient, w, id)
 		case "ack":
-			handleWorkflowAck(ctx, wfClient, w, r, id)
+			handleWorkflowEvent(ctx, wfClient, w, r, id, ackEventName, nil)
+		case "approve":
+			handleWorkflowEvent(ctx, wfClient, w, r, id, decisionEventName, map[string]any{"decision": "approve"})
+		case "reject":
+			handleWorkflowEvent(ctx, wfClient, w, r, id, decisionEventName, map[string]any{"decision": "reject"})
 		case "page":
 			handleWorkflowPage(ctx, wfClient, w, r, id)
 		default:
@@ -446,28 +779,32 @@ func handleWorkflowQuery(ctx context.Context, wfClient *workflow.Client, w http.
 	_ = json.NewEncoder(w).Encode(meta)
 }
 
-// handleWorkflowAck — POST /workflows/{id}/ack raises the "ack" external
-// event on the workflow. Body is optional {acked_by, note}. This is what
-// the HTMX button on /workflows/{id}/page POSTs to.
+// handleWorkflowEvent raises a named external event on the workflow
+// (ack / decision). Body is any JSON object; it's passed through as the
+// event payload, optionally with `inject` fields merged in so callers of
+// /approve and /reject get the decision baked in server-side without
+// having to trust the client.
 //
-// Dapr's RaiseEvent is fire-and-forget from the caller's perspective — a
-// 200 here means "the event was accepted by the workflow engine", not
+// The workflow's Await unmarshals into the struct it expects (ackEvent
+// for "ack", decisionEvent for "decision").
+//
+// Dapr's RaiseEvent is fire-and-forget from the caller's perspective —
+// a 200 here means "the event was accepted by the workflow engine", not
 // "the workflow has processed it". The workflow itself may take a moment
 // to observe the event; verify sleeps briefly before re-checking status.
-func handleWorkflowAck(ctx context.Context, wfClient *workflow.Client, w http.ResponseWriter, r *http.Request, id string) {
+func handleWorkflowEvent(ctx context.Context, wfClient *workflow.Client, w http.ResponseWriter, r *http.Request, id, eventName string, inject map[string]any) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
 
-	var ack ackEvent
-	// Empty body is fine — defaults are honest ("unknown", "").
-	_ = json.NewDecoder(r.Body).Decode(&ack)
-	if ack.AckedBy == "" {
-		ack.AckedBy = "anonymous"
+	body := map[string]any{}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	for k, v := range inject {
+		body[k] = v
 	}
 
-	if err := wfClient.RaiseEvent(ctx, id, ackEventName, workflow.WithEventPayload(ack)); err != nil {
+	if err := wfClient.RaiseEvent(ctx, id, eventName, workflow.WithEventPayload(body)); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -475,18 +812,24 @@ func handleWorkflowAck(ctx context.Context, wfClient *workflow.Client, w http.Re
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"instance_id": id,
-		"status":      "ack-raised",
-		"acked_by":    ack.AckedBy,
+		"event":       eventName,
+		"status":      "event-raised",
+		"payload":     body,
 	})
 }
 
 // handleWorkflowPage — GET /workflows/{id}/page serves a tiny HTMX ack UI.
 // No auth (demo affordance, single-user port-forward). Renders the workflow
-// metadata + input anomaly, plus (only while the workflow is RUNNING) a
-// button that POSTs to /workflows/{id}/ack and swaps the outcome inline.
-// For terminal-state workflows, shows the recorded outcome instead of the
-// button — clicking ack on a completed workflow is a Dapr error, so we
-// don't offer it.
+// metadata + input, plus (only while the workflow is RUNNING) the
+// appropriate buttons for the workflow type — Acknowledge for
+// TriageWorkflow, Approve/Reject for OptimisationWorkflow.
+//
+// This is the T14 reusability payoff: one page, one handler, two workflow
+// types. The polymorphism is:
+//   - subject block: anomaly <dl> vs optimisation <dl>
+//   - action block: single ack button vs approve/reject pair
+//   - outcome block: acked/unacked vs approved/rejected/expired
+// All three vary by workflow name, which we read from meta.Name.
 func handleWorkflowPage(ctx context.Context, wfClient *workflow.Client, w http.ResponseWriter, _ *http.Request, id string) {
 	meta, err := wfClient.FetchWorkflowMetadata(ctx, id, workflow.WithFetchPayloads(true))
 	if err != nil {
@@ -494,14 +837,111 @@ func handleWorkflowPage(ctx context.Context, wfClient *workflow.Client, w http.R
 		return
 	}
 
-	// Best-effort pull of the original anomaly payload out of the workflow
-	// serialised input. If Dapr didn't fetch payloads for us, we still show
-	// the metadata; the action area still renders.
-	anomalyBlock := ""
+	subjectBlock, actionRunningBlock, outcomeBlock, title, h1 := renderByWorkflowType(meta, id)
+
+	statusStr := meta.RuntimeStatus.String()
+	statusClass := "status"
+	switch statusStr {
+	case "COMPLETED":
+		statusClass = "status completed"
+	case "FAILED", "TERMINATED", "CANCELED":
+		statusClass = "status failed"
+	}
+
+	actionBlock := ""
+	isRunning := statusStr == "RUNNING" || statusStr == "PENDING"
+	if isRunning {
+		actionBlock = actionRunningBlock
+	} else {
+		actionBlock = outcomeBlock
+	}
+
+	page := fmt.Sprintf(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>%s</title>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <script>
+    // Called by any decision button's hx-on::after-request. On success,
+    // give the workflow ~1.5s to observe the event and complete, then
+    // reload so the status bar + outcome block re-render.
+    function ackDone(evt) {
+      if (!evt.detail || !evt.detail.successful) return;
+      var btn = evt.target;
+      btn.disabled = true;
+      btn.textContent = 'Recorded \u2014 completing workflow...';
+      // Disable sibling buttons too so a fast user can't double-click.
+      var sibs = btn.parentNode.querySelectorAll('button');
+      for (var i = 0; i < sibs.length; i++) sibs[i].disabled = true;
+      setTimeout(function () { window.location.reload(); }, 1500);
+    }
+  </script>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 40em; margin: 2em auto; padding: 0 1em; color: #1a202c; }
+    dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25em 1em; }
+    dt { font-weight: bold; }
+    button { padding: 0.75em 1.5em; font-size: 1em; color: white; border: 0; border-radius: 4px; cursor: pointer; margin-right: 0.5em; }
+    button.primary { background: #2b6cb0; }
+    button.primary:hover { background: #2c5282; }
+    button.approve { background: #38a169; }
+    button.approve:hover { background: #276749; }
+    button.reject { background: #c53030; }
+    button.reject:hover { background: #9b2c2c; }
+    .status { padding: 0.5em 0.75em; border-radius: 4px; margin: 1em 0; background: #edf2f7; }
+    .status.completed { background: #c6f6d5; }
+    .status.failed { background: #fed7d7; }
+    .outcome { padding: 0.75em; border-radius: 4px; background: #f7fafc; border-left: 4px solid #4a5568; }
+    .outcome.acked, .outcome.approved { border-left-color: #38a169; background: #f0fff4; }
+    .outcome.unacked, .outcome.expired { border-left-color: #dd6b20; background: #fffaf0; }
+    .outcome.rejected { border-left-color: #c53030; background: #fff5f5; }
+    .outcome dl { margin: 0.25em 0; }
+    small { color: #4a5568; }
+  </style>
+</head>
+<body>
+  <h1>%s</h1>
+  <p class="%s">Workflow <code>%s</code> (<code>%s</code>) — status: <strong>%s</strong></p>
+  %s
+  <div id="ack-outcome">%s
+  </div>
+</body>
+</html>`,
+		htmlEscape(title),
+		htmlEscape(h1),
+		statusClass, htmlEscape(id), htmlEscape(meta.Name), htmlEscape(statusStr),
+		subjectBlock,
+		actionBlock)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(page))
+}
+
+// renderByWorkflowType returns the four HTML fragments that vary by workflow
+// type: subject <dl>, action block when RUNNING, outcome block when terminal,
+// page <title>, and page <h1>.
+//
+// Dispatched on meta.Name. Anything Dapr doesn't know about falls back to
+// a generic rendering that at least shows the metadata.
+func renderByWorkflowType(meta *workflow.Metadata, id string) (subject, runningAction, outcome, title, h1 string) {
+	switch meta.Name {
+	case "TriageWorkflow":
+		return renderTriage(meta, id)
+	case "OptimisationWorkflow":
+		return renderOptimisation(meta, id)
+	default:
+		return renderGeneric(meta, id)
+	}
+}
+
+func renderTriage(meta *workflow.Metadata, id string) (subject, runningAction, outcome, title, h1 string) {
+	title = "triage-svc ack — " + id
+	h1 = "Cost anomaly triage"
+
 	if meta.SerializedInput != "" {
 		var a finops.Anomaly
 		if err := json.Unmarshal([]byte(meta.SerializedInput), &a); err == nil {
-			anomalyBlock = fmt.Sprintf(
+			subject = fmt.Sprintf(
 				`<dl>
   <dt>Team</dt><dd>%s (%s)</dd>
   <dt>Service</dt><dd>%s</dd>
@@ -516,26 +956,9 @@ func handleWorkflowPage(ctx context.Context, wfClient *workflow.Client, w http.R
 		}
 	}
 
-	// The status bar gets a class based on the terminal outcome so it colours
-	// green for acked, amber for unacked/escalated-out, blue for running.
-	statusStr := meta.RuntimeStatus.String()
-	statusClass := "status"
-	switch statusStr {
-	case "COMPLETED":
-		statusClass = "status completed"
-	case "FAILED", "TERMINATED", "CANCELED":
-		statusClass = "status failed"
-	}
-
-	// Action area: button (if running) OR outcome summary (if terminal).
-	// Wrapped in #ack-outcome so HTMX's swap replaces the whole action area,
-	// not just the button. That way the "ack raised" response is replaced by
-	// the outcome once the workflow completes on a page refresh.
-	actionBlock := ""
-	isRunning := statusStr == "RUNNING" || statusStr == "PENDING"
-	if isRunning {
-		actionBlock = fmt.Sprintf(`
-    <button hx-post="/workflows/%s/ack"
+	runningAction = fmt.Sprintf(`
+    <button class="primary"
+            hx-post="/workflows/%s/ack"
             hx-headers='{"Content-Type":"application/json"}'
             hx-vals='{"acked_by":"demo-human","note":"acked from HTMX"}'
             hx-swap="none"
@@ -544,66 +967,74 @@ func handleWorkflowPage(ctx context.Context, wfClient *workflow.Client, w http.R
     </button>
     <p><small>Clicking raises an <code>ack</code> event on the workflow. The workflow's <code>WaitForExternalEvent("ack", %s)</code> resolves and the run completes.
     Page will reload automatically to show the outcome.</small></p>`,
-			htmlEscape(id), ackTimeout())
-	} else {
-		actionBlock = renderOutcome(meta)
-	}
+		htmlEscape(id), ackTimeout())
 
-	page := fmt.Sprintf(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>triage-svc ack — %s</title>
-  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
-  <script>
-    // Called by the ack button's hx-on::after-request. On successful ack,
-    // give the workflow ~1.5s to observe the event and complete, then
-    // reload so the status bar + outcome block re-render.
-    function ackDone(evt) {
-      if (!evt.detail || !evt.detail.successful) return;
-      var btn = evt.target;
-      btn.disabled = true;
-      btn.textContent = 'Acknowledged \u2014 completing workflow...';
-      setTimeout(function () { window.location.reload(); }, 1500);
-    }
-  </script>
-  <style>
-    body { font-family: -apple-system, sans-serif; max-width: 40em; margin: 2em auto; padding: 0 1em; color: #1a202c; }
-    dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25em 1em; }
-    dt { font-weight: bold; }
-    button { padding: 0.75em 1.5em; font-size: 1em; background: #2b6cb0; color: white; border: 0; border-radius: 4px; cursor: pointer; }
-    button:hover { background: #2c5282; }
-    .status { padding: 0.5em 0.75em; border-radius: 4px; margin: 1em 0; background: #edf2f7; }
-    .status.completed { background: #c6f6d5; }
-    .status.failed { background: #fed7d7; }
-    .outcome { padding: 0.75em; border-radius: 4px; background: #f7fafc; border-left: 4px solid #4a5568; }
-    .outcome.acked { border-left-color: #38a169; background: #f0fff4; }
-    .outcome.unacked { border-left-color: #dd6b20; background: #fffaf0; }
-    .outcome dl { margin: 0.25em 0; }
-    small { color: #4a5568; }
-  </style>
-</head>
-<body>
-  <h1>Cost anomaly triage</h1>
-  <p class="%s">Workflow <code>%s</code> — status: <strong>%s</strong></p>
-  %s
-  <div id="ack-outcome">%s
-  </div>
-</body>
-</html>`,
-		htmlEscape(id),
-		statusClass, htmlEscape(id), htmlEscape(statusStr),
-		anomalyBlock,
-		actionBlock)
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte(page))
+	outcome = renderTriageOutcome(meta)
+	return
 }
 
-// renderOutcome pulls the workflow's serialised output and formats a small
-// summary block. Handles the two happy shapes (acked / unacked) plus a
-// generic fallback if the output doesn't match the expected schema.
-func renderOutcome(meta *workflow.Metadata) string {
+func renderOptimisation(meta *workflow.Metadata, id string) (subject, runningAction, outcome, title, h1 string) {
+	title = "triage-svc optimisation — " + id
+	h1 = "Cost optimisation approval"
+
+	if meta.SerializedInput != "" {
+		var r finops.IdleResource
+		if err := json.Unmarshal([]byte(meta.SerializedInput), &r); err == nil {
+			subject = fmt.Sprintf(
+				`<dl>
+  <dt>Team</dt><dd>%s (%s)</dd>
+  <dt>Service</dt><dd>%s</dd>
+  <dt>Resource</dt><dd>%s <code>%s</code></dd>
+  <dt>Idle for</dt><dd>%d days</dd>
+  <dt>Monthly waste</dt><dd>$%.2f</dd>
+  <dt>Suggested action</dt><dd><strong>%s</strong></dd>
+</dl>`,
+				htmlEscape(r.TeamName), htmlEscape(r.TeamID),
+				htmlEscape(r.Service),
+				htmlEscape(r.ResourceType), htmlEscape(r.ResourceID),
+				r.DaysIdle, r.MonthlyWasteUSD,
+				htmlEscape(r.SuggestedAction))
+		}
+	}
+
+	runningAction = fmt.Sprintf(`
+    <button class="approve"
+            hx-post="/workflows/%s/approve"
+            hx-headers='{"Content-Type":"application/json"}'
+            hx-vals='{"decided_by":"demo-human","note":"approved from HTMX"}'
+            hx-swap="none"
+            hx-on::after-request="ackDone(event)">
+      Approve
+    </button>
+    <button class="reject"
+            hx-post="/workflows/%s/reject"
+            hx-headers='{"Content-Type":"application/json"}'
+            hx-vals='{"decided_by":"demo-human","note":"rejected from HTMX"}'
+            hx-swap="none"
+            hx-on::after-request="ackDone(event)">
+      Reject
+    </button>
+    <p><small>Approving raises an <code>approve</code> event; rejecting raises <code>reject</code>. Either resolves the workflow's decision race. If neither is clicked within <code>%s</code>, the workflow completes as <em>expired</em> (no destructive action taken).
+    Page will reload after clicking.</small></p>`,
+		htmlEscape(id), htmlEscape(id), decisionTimeout())
+
+	outcome = renderOptimisationOutcome(meta)
+	return
+}
+
+func renderGeneric(meta *workflow.Metadata, id string) (subject, runningAction, outcome, title, h1 string) {
+	title = "workflow — " + id
+	h1 = "Workflow: " + meta.Name
+	subject = fmt.Sprintf(`<p><small>No specialised rendering for workflow type <code>%s</code>.</small></p>`, htmlEscape(meta.Name))
+	runningAction = `<p>This workflow type has no interactive controls defined.</p>`
+	outcome = fmt.Sprintf(`<div class="outcome"><small>Output:</small><br><code>%s</code></div>`, htmlEscape(meta.SerializedOutput))
+	return
+}
+
+// renderTriageOutcome pulls the workflow's serialised output and formats a
+// small summary block for TriageWorkflow (acked / unacked). Falls back to
+// raw output for anything unexpected.
+func renderTriageOutcome(meta *workflow.Metadata) string {
 	if meta.SerializedOutput == "" {
 		return `<p class="outcome">Workflow ended with no output.</p>`
 	}
@@ -641,6 +1072,62 @@ func renderOutcome(meta *workflow.Metadata) string {
         <dt>Outcome</dt><dd>All notifications were delivered; nobody acknowledged in time.</dd>
       </dl>
     </div>`, out.Escalations)
+	default:
+		return fmt.Sprintf(`<div class="outcome"><small>Outcome:</small><br><code>%s</code></div>`,
+			htmlEscape(meta.SerializedOutput))
+	}
+}
+
+// renderOptimisationOutcome mirrors renderTriageOutcome for OptimisationWorkflow.
+// Three terminal states — approved / rejected / expired — each with distinct
+// framing. Colouring drives the story: green for approved, red for rejected,
+// amber for expired (no decision, no destructive action taken).
+func renderOptimisationOutcome(meta *workflow.Metadata) string {
+	if meta.SerializedOutput == "" {
+		return `<p class="outcome">Workflow ended with no output.</p>`
+	}
+	var d decisionRecord
+	if err := json.Unmarshal([]byte(meta.SerializedOutput), &d); err != nil {
+		return fmt.Sprintf(`<p class="outcome"><small>Raw output:</small><br><code>%s</code></p>`,
+			htmlEscape(meta.SerializedOutput))
+	}
+
+	noteRow := ""
+	if d.Note != "" {
+		noteRow = fmt.Sprintf(`<dt>Note</dt><dd>%s</dd>`, htmlEscape(d.Note))
+	}
+
+	switch d.Decision {
+	case "approved":
+		return fmt.Sprintf(`<div class="outcome approved">
+      <strong>Approved.</strong>
+      <dl>
+        <dt>By</dt><dd>%s</dd>
+        %s
+        <dt>At</dt><dd>%s</dd>
+        <dt>Estimated monthly savings</dt><dd>$%.2f</dd>
+      </dl>
+      <p><small>Decision recorded to state-postgres under <code>%s%s</code>.</small></p>
+    </div>`, htmlEscape(d.DecidedBy), noteRow, htmlEscape(d.DecidedAt),
+			d.MonthlyWasteUSD, decisionStateKeyPrefix, htmlEscape(d.ResourceID))
+	case "rejected":
+		return fmt.Sprintf(`<div class="outcome rejected">
+      <strong>Rejected.</strong>
+      <dl>
+        <dt>By</dt><dd>%s</dd>
+        %s
+        <dt>At</dt><dd>%s</dd>
+      </dl>
+      <p><small>Owner declined the suggested action; no cleanup will be performed.</small></p>
+    </div>`, htmlEscape(d.DecidedBy), noteRow, htmlEscape(d.DecidedAt))
+	case "expired":
+		return fmt.Sprintf(`<div class="outcome expired">
+      <strong>Decision window expired.</strong>
+      <dl>
+        <dt>Outcome</dt><dd>No decision received within the window.</dd>
+        <dt>Default</dt><dd>No destructive action taken (conservative default).</dd>
+      </dl>
+    </div>`)
 	default:
 		return fmt.Sprintf(`<div class="outcome"><small>Outcome:</small><br><code>%s</code></div>`,
 			htmlEscape(meta.SerializedOutput))
@@ -786,6 +1273,13 @@ func isConcurrencyConflict(err error) bool {
 // Dapr instance IDs must match [a-zA-Z0-9_-]+ so we replace colons.
 func workflowInstanceID(a finops.Anomaly) string {
 	return "triage-" + strings.ReplaceAll(a.ID(), ":", "-")
+}
+
+// optimisationInstanceID does the same for T14's IdleResource. Same
+// colon-substitution discipline; different prefix so the two workflow
+// families are visually distinguishable in the inbox.
+func optimisationInstanceID(r finops.IdleResource) string {
+	return "opt-" + strings.ReplaceAll(r.ID(), ":", "-")
 }
 
 // isDuplicateInstance detects Dapr's "instance already exists" error, which

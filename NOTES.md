@@ -562,3 +562,105 @@ The whole rest of the stack has been building to this. `triage-svc` now runs a r
 - **The workflow model is the strongest single feature.** Everything else has strong open-source alternatives with better UX (Temporal for workflows, Envoy for service mesh, Vault for secrets, plain RabbitMQ for pub/sub). Dapr's win isn't "best in each category" — it's "acceptable in every category, from one sidecar, with one config surface." A "workflow as easy to write as a Go function" is genuinely novel and doesn't require adopting Dapr for anything else. **If we take one thing from this whole demo into production, it's Dapr Workflows.**
 - **Missing polish for a real demo:** an HTMX "list of running workflows with ack buttons" page (that's T15). A `terminate` button. A "why did this escalate?" trace-view link. All doable as smaller follow-ups.
 - Ready for T14 (resiliency policies — kill notifier-svc mid-workflow and observe) and T15 (HTMX ops page over T11.5's inbox).
+
+## T14 — the second workflow (OptimisationWorkflow, approve/reject/expired)
+
+The whole point of this slice: does the T12 pattern hold for a *second* workflow type? Answer: **yes, and the deltas are exactly where they should be — in the domain, not in the plumbing.** A second workflow, three activities, four HTTP routes, one polymorphic HTMX page — ~350 lines added on top of T12, most of it domain HTML.
+
+### What was reusable across the two workflows
+
+- **Workflow registration & activity registration.** Same `worker.RegisterWorkflow(...)` / `worker.RegisterActivity(...)` calls — three new registrations, same pattern.
+- **Package-level Dapr client for activities.** The `activityDaprClient` global is used by both `NotifyOwnerActivity` and `NotifyOptimisationActivity` unchanged. The DI ugliness is paid once.
+- **Instance-ID discipline.** Same `strings.ReplaceAll(":", "-")` trick, same "prefix per workflow family" convention (`triage-` vs `opt-`), same `isDuplicateInstance` error detection.
+- **Workflow index (T11.5).** Adding a second workflow type didn't require touching the index. Both workflows call the same `appendToWorkflowIndex()`. The `/optimisations` view is one prefix filter on top of the shared index.
+- **HTMX page shell.** One handler (`handleWorkflowPage`), dispatched by `meta.Name` to `renderTriage` / `renderOptimisation` / `renderGeneric`. Status bar, auto-reload script, style block — all shared.
+- **Event-raising handler.** `handleWorkflowEvent` now takes an `inject` map and works for `/ack`, `/approve`, `/reject`. Adding a fourth event type is a two-line change.
+- **Timeout config via env vars.** Same `os.Getenv → time.Duration` pattern, one helper per workflow type. Trivial to change per environment.
+
+### What Dapr did NOT reuse for me — and where the abstraction is thin
+
+- **No polymorphic "kick off any workflow" API.** `handleTriageStart` and `handleOptimisationStart` are near-clones: read JSON → `ScheduleNewWorkflow` → append to index → return. Dapr's SDK forces the caller to name the workflow at schedule time, so a generic dispatcher would need reflection or a workflow-name-to-input-type registry we build ourselves. ~50 lines of duplication per new workflow type. **Real cost, not a critical one.**
+- **No polymorphic decision recording.** Persisting the outcome to state store (`RecordDecisionActivity`) is a T14-specific activity because the decision *record shape* is T14-specific. If we add a third workflow with its own outcome shape, we'll write a third activity. Dapr has no opinion here — state is just bytes.
+- **Payload dispatch at the notifier is manual.** `notifier-svc`'s `/notify` grew a `if optimisation: … else: …` branch. Two workflow types today, N branches tomorrow. **This is where the "one notification service across all workflows" idea meets its first real cost.** In production, either accept the branching (fine for a few types) or split into per-type notifiers (loses the single-endpoint story).
+- **No `WhenAny` in durabletask-go@v0.5.0.** My first attempt at OptimisationWorkflow raced two `WaitForExternalEvent` tasks — one for `approve`, one for `reject`. Sequential `Await` calls blocked full timeouts even after one won. Refactored to a single `decision` event discriminated by payload; the two HTTP routes (`/approve`, `/reject`) inject the discriminator server-side. **This is a real gap** — most other workflow SDKs have `WhenAny` (Temporal's Selector, C# `Task.WhenAny`). Worth flagging in the pitch.
+- **No workflow-name query.** To answer "list all pending optimisation approvals", I filter by instance-ID prefix (`opt-`). Reliable because we set the prefix, but it's convention-not-contract. If someone starts an OptimisationWorkflow with a different prefix, they disappear from `/optimisations`. Dapr provides no server-side filter on workflow name.
+
+### Pros
+
+- **Adding a second workflow is bounded work.** ~350 net new lines total (Go workflow + activity + 2 HTTP handlers + HTMX render fns + notifier extension + shared type + tests). No new infrastructure, no new components, no new secrets. The polyglot NOTES from T13 already covered "adding a service"; this proves "adding a *workflow type* to an existing service" is similarly cheap.
+- **The HTMX page polymorphism paid off.** Same URL (`/workflows/{id}/page`) serves both. Users bookmark the workflow ID; the page adapts. Same is true of `/workflows/{id}` (metadata) and `/workflows` (inbox). The generic layer is the workflow-instance identity; the polymorphism is at the rendering edge.
+- **State persistence outside the workflow is clean.** `RecordDecisionActivity` writes to `state-postgres` under `optimisation-decision:{resource_id}`, so the decision survives even if we later purge the workflow instance. This is a good pattern to internalize: **workflow output = short-term; state store = long-term.**
+- **Two workflows share one Dapr worker.** No new sidecar, no new port, no new placement config. This is where Dapr's "workflow as a first-class primitive of the sidecar" starts to compound.
+
+### Cons
+
+- **The `/approve` + `/reject` HTTP surface is a lie about the workflow shape.** The workflow only waits on one event (`decision`) — two HTTP routes exist for URL clarity. Server-side `inject` merges the discriminator into the payload. Reader of the HTTP surface expects two independent events; reader of the workflow code sees one. **The mismatch is deliberate but should be documented, otherwise the next engineer will refactor one side and break the other.**
+- **Notifier `/notify` polymorphism will keep growing.** Adding a third workflow type means a third `if body.get("...")` branch. Left unchecked, `/notify` becomes a discriminator switch. Alternative: split into `/notify-anomaly` and `/notify-optimisation`. Trade-off: single endpoint (simple caller story) vs. clean per-type endpoints (clean receiver story). We chose single for now.
+- **Same "raise-event-before-wait race" as T12.** Verify sleeps 4s between schedule and decide for the same reason. Applies to all workflows built on this pattern — worth calling out in ADR.
+
+### Gotchas
+
+- **durabletask-go@v0.5.0 has no `WhenAny`.** See above. Cost me one debug cycle. The workaround (single event + discriminator) is arguably cleaner anyway, but it's a real limitation vs. Temporal/Cadence.
+- **`renderByWorkflowType` needs a `default` branch.** During development I forgot to handle unknown workflow names and the page rendered blank. Added `renderGeneric` for anything not-triage-not-optimisation — falls back to "output: <raw JSON>". Cheap insurance.
+- **`event-raised` doesn't mean "workflow observed it".** Same as T12. `/approve` returning 200 means the sidecar accepted the event; the workflow completes ~1-2s later. HTMX's auto-reload delay handles this UX-side; verify sleeps 3s server-side.
+- **Instance IDs are long.** `opt-optimisation-team-verify-approve-vol-verify-approve-delete` is 68 chars. Cosmetic, but URLs get ugly quickly. In production I'd use a hash of the ID for the URL and keep the human-readable one only in the input/output payloads.
+
+### Overhead
+
+- 350 net LOC on top of T12 for a full second workflow type: types + workflow + 2 activities + 2 HTTP handlers + HTMX polymorphism + notifier extension + 6 unit tests.
+- No new pods, no new components, no new sidecar. Same triage-svc container hosts both workflow types.
+- 14/14 notifier unit tests green including 4 new ones for `build_optimisation_payload`.
+- Verify now includes 3 additional workflow scenarios (approve, reject, expired) adding ~50s to the total run (the expired path waits 35s alone).
+
+### Personas — who's actually on each side of these workflows
+
+The 30-second timeouts are demo/stage compressions. Real production timeframes are hours to weeks, and the confusion during the walkthrough — "wait, who was supposed to do what?" — is a genuine signal the app needs personas documented, not just endpoints. Naming them explicitly:
+
+| Persona | What they do | Where they show up in the code |
+|---|---|---|
+| **Resource owner** (team engineer) | Receives the notification. Decides ack / approve / reject. | The `demo-human` value in the HTMX button POSTs. In production this is a Slack user, an on-call engineer, or an authenticated web session. |
+| **FinOps platform engineer** | Owns detection rules, thresholds, escalation policy, `ACK_TIMEOUT_SECONDS` / `MAX_ESCALATIONS` / `DECISION_TIMEOUT_SECONDS`. Runs the cluster. | Env vars in `deploy/apps/triage-svc.yaml`; component YAML in `deploy/dapr/`; the detection cfg in `services/rollup-svc/main.go`. |
+| **Escalation recipient** (team lead / manager) | For T12 only — receives the *second and third* notifications if the resource owner doesn't ack in time. Same Slack channel by default in the demo; a distinct channel/user in real production. | Currently the same webhook — a real deployment would fan out per escalation round via a different `kind` handler or a second component. |
+| **Auditor / finance** | Reads the decision record long after the workflow closed. "Who approved deleting this? When? With what note?" | Reads `optimisation-decision:{resource_id}` from state-postgres — the record survives workflow purge for exactly this reason. |
+| **The system itself** | When nobody responds, applies the safe default (unacked for triage, expired for optimisation). No destructive action without human. | The `err == task.ErrTaskCanceled` branch in each workflow. |
+
+**Realistic time budgets** (what the env vars would look like off-stage):
+
+| Workflow | Demo (in-cluster today) | Realistic production |
+|---|---|---|
+| TriageWorkflow ack timeout | 30s / round | 15 min – 2 hr (paged?), escalate to on-call after |
+| TriageWorkflow max escalations | 2 (~90s total) | 3–5, last one to a manager or duty rota |
+| OptimisationWorkflow decision timeout | 30s | 3–7 days (business days) — cleanup isn't urgent |
+
+The compression exists so verify runs in ~2 minutes and the on-stage demo doesn't require asking the audience to wait 15 minutes. **In the pitch, name this compression explicitly** — otherwise a skeptic will (correctly) note that 30s of "human decision time" is absurd, and the whole talk lands as unserious.
+
+### The trade — system complexity ⇄ code complexity
+
+The most honest framing of what Dapr actually gives you. Not "Dapr makes things simple" — **Dapr moves complexity from where your app engineers live to where your platform engineers live, and it does the moving in a repeatable, off-the-shelf way.**
+
+Scored for this slice specifically:
+
+| Dimension | Delta from T14 | Who pays |
+|---|---|---|
+| **Code complexity** | ~350 LOC domain, one polymorphism point in the notifier, one in the HTMX page | App developer (down — one page of workflow for a whole business process) |
+| **System complexity** | Zero (reuses T11 actor state store, T13 notifier, existing sidecars) | Platform engineer (nothing new to operate) |
+| **Cognitive load** | New workflow name, one new state-store key convention, one new HTTP surface | Newcomer to the code (small — reading top-to-bottom tells the story) |
+| **Operational load** | +3 test workflows on each verify run; +1 state-store key family | On-call (essentially zero) |
+
+**Verdict:** code wins big. This slice adds a full workflow type at essentially no operational cost — the platform/system side was paid in T1, T2, T11. Every subsequent workflow slice gets cheaper the same way.
+
+**When this trade goes the other direction** (worth noting for the honest pitch): if we didn't have a stack of pre-paid Dapr scaffolding, T14 would cost:
+- A workflow engine (Temporal + its own DB) — days of setup
+- A retry/timeout framework — glue code
+- A pub/sub story for the notify hop — a broker
+- An RPC framework for the notify call — protobuf definitions or an OpenAPI spec
+- A schema/decision store — another Postgres table + migrations
+
+**The trade is only worth it if you're going to build 3+ of these things.** For a shop with one workflow, roll-your-own is fine. For a shop with 20, Dapr's compounding wins.
+
+### Meta
+
+- **This slice is the strongest evidence that Dapr's abstraction is domain-shaped, not workflow-shaped.** Everything that varies between the two workflows is domain code (payload shape, decision semantics, page rendering). Everything that's shared is either Dapr (sidecar, worker, state store, service invocation) or thin adapter code (event routing, page shell). If the abstraction were leaky, the shared code would be full of `switch workflow_type` — it isn't; the dispatches happen at exactly two well-known points (`renderByWorkflowType` in the UI, payload-shape in the notifier).
+- **For the pitch:** "we added a second workflow that reuses ~80% of the T12 infrastructure and 100% of the Dapr concepts. The delta is the domain — as it should be." That's the compact version.
+- **Follow-up worth ADR'ing:** "single /notify endpoint vs. per-workflow notify endpoints" — the notifier will accumulate discriminator branches; this is the moment to decide the pattern.
+- Ready for T15 (chaos / kill-things) and T16 (sidecar overhead measurement) — the last two "honest cost" slices.

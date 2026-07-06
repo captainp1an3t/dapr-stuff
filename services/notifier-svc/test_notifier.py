@@ -66,3 +66,56 @@ def test_delta_pct_rounding(delta_pct, expected):
     a = {**BASE_ANOMALY, "delta_pct": delta_pct}
     p = build_slack_payload(a, "initial")
     assert expected in p["text"]
+
+
+# ---- T14 optimisation payload tests ----------------------------------------
+from notifier import build_optimisation_payload
+
+BASE_OPTIMISATION = {
+    "team_id": "team-payments",
+    "team_name": "Payments Platform",
+    "service": "ebs",
+    "resource_id": "vol-abc123",
+    "resource_type": "EBS volume",
+    "monthly_waste_usd": 42.50,
+    "days_idle": 45,
+    "suggested_action": "delete",
+}
+
+
+def test_optimisation_text_includes_key_facts():
+    p = build_optimisation_payload(BASE_OPTIMISATION, "optimisation-request")
+    text = p["text"]
+    assert "Payments Platform" in text
+    assert "EBS volume" in text
+    assert "vol-abc123" in text
+    assert "ebs" in text
+    assert "45 days" in text
+    assert "$42.50" in text
+    assert "delete" in text
+    assert "[OPTIMISATION]" in text
+
+
+def test_optimisation_field_titles():
+    p = build_optimisation_payload(BASE_OPTIMISATION, "optimisation-request")
+    titles = [f["title"] for f in p["attachments"][0]["fields"]]
+    assert "Team" in titles
+    assert "Resource" in titles
+    assert "Monthly waste" in titles
+    assert "Suggested action" in titles
+    # None of the anomaly-specific fields leak in.
+    assert "Delta" not in titles
+    assert "Baseline" not in titles
+
+
+def test_optimisation_missing_fields_do_not_crash():
+    p = build_optimisation_payload({}, "optimisation-request")
+    assert "text" in p
+    assert p["attachments"][0]["color"] == "good"
+
+
+def test_optimisation_uses_team_id_when_team_name_missing():
+    opt = {**BASE_OPTIMISATION}
+    opt.pop("team_name")
+    p = build_optimisation_payload(opt, "optimisation-request")
+    assert "team-payments" in p["text"]

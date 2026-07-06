@@ -276,6 +276,63 @@ verify: ## Smoke-test the current stack (run after `make up` in another shell)
 	  echo "$$page" | grep -q 'htmx.org' && echo "    HTMX script loaded" || (echo "  MISSING htmx"; exit 1); \
 	  echo "$$page" | grep -q 'outcome acked' && echo "    Acked outcome block present" || (echo "  MISSING acked outcome"; exit 1); \
 	  echo "$$page" | grep -q '<button' && (echo "  UNEXPECTED: button should be hidden on completed workflow"; exit 1) || echo "    Button correctly hidden on completed workflow"
+	@echo
+	@echo "== T14 second workflow: OptimisationWorkflow (approve / reject / expired) =="
+	@echo "  (triage-svc runs with DECISION_TIMEOUT_SECONDS=30 in-cluster)"
+	@echo "  --- Case A: approve path — start, POST /approve within window, expect decision=approved"
+	@curl -sS -X POST -H 'Content-Type: application/json' \
+	    -d '{"team_id":"team-verify-approve","team_name":"Verify Approve","service":"ebs","resource_id":"vol-verify-approve","resource_type":"EBS volume","monthly_waste_usd":42.5,"days_idle":45,"suggested_action":"delete"}' \
+	    http://localhost:8082/optimisation | python3 -m json.tool | sed 's/^/    /'
+	@sleep 4
+	@curl -sS -X POST -H 'Content-Type: application/json' -d '{"decided_by":"verify","note":"approve path"}' \
+	    http://localhost:8082/workflows/opt-optimisation-team-verify-approve-vol-verify-approve-delete/approve | python3 -m json.tool | sed 's/^/    /'
+	@sleep 3
+	@meta=$$(curl -sS http://localhost:8082/workflows/opt-optimisation-team-verify-approve-vol-verify-approve-delete); \
+	  status=$$(echo "$$meta" | python3 -c 'import sys,json; print(json.load(sys.stdin)["status"])'); \
+	  decision=$$(echo "$$meta" | python3 -c 'import sys,json; print(json.loads(json.load(sys.stdin).get("serializedOutput") or "{}").get("decision",""))'); \
+	  by=$$(echo "$$meta" | python3 -c 'import sys,json; print(json.loads(json.load(sys.stdin).get("serializedOutput") or "{}").get("decided_by",""))'); \
+	  echo "    status=$$status decision=$$decision decided_by=$$by"; \
+	  [ "$$status" = "1" ] || (echo "  expected status=1 COMPLETED"; exit 1); \
+	  [ "$$decision" = "approved" ] || (echo "  expected decision=approved"; exit 1); \
+	  [ "$$by" = "verify" ] || (echo "  expected decided_by=verify"; exit 1)
+	@echo "  --- Case B: reject path — start, POST /reject within window, expect decision=rejected"
+	@curl -sS -X POST -H 'Content-Type: application/json' \
+	    -d '{"team_id":"team-verify-reject","team_name":"Verify Reject","service":"rds","resource_id":"db-verify-reject","resource_type":"RDS instance","monthly_waste_usd":250,"days_idle":60,"suggested_action":"downsize"}' \
+	    http://localhost:8082/optimisation | python3 -m json.tool | sed 's/^/    /'
+	@sleep 4
+	@curl -sS -X POST -H 'Content-Type: application/json' -d '{"decided_by":"verify","note":"reject path"}' \
+	    http://localhost:8082/workflows/opt-optimisation-team-verify-reject-db-verify-reject-downsize/reject | python3 -m json.tool | sed 's/^/    /'
+	@sleep 3
+	@meta=$$(curl -sS http://localhost:8082/workflows/opt-optimisation-team-verify-reject-db-verify-reject-downsize); \
+	  status=$$(echo "$$meta" | python3 -c 'import sys,json; print(json.load(sys.stdin)["status"])'); \
+	  decision=$$(echo "$$meta" | python3 -c 'import sys,json; print(json.loads(json.load(sys.stdin).get("serializedOutput") or "{}").get("decision",""))'); \
+	  echo "    status=$$status decision=$$decision"; \
+	  [ "$$status" = "1" ] || (echo "  expected status=1"; exit 1); \
+	  [ "$$decision" = "rejected" ] || (echo "  expected decision=rejected"; exit 1)
+	@echo "  --- Case C: expired path — start, do NOT decide, wait for timeout"
+	@curl -sS -X POST -H 'Content-Type: application/json' \
+	    -d '{"team_id":"team-verify-expired","team_name":"Verify Expired","service":"ec2","resource_id":"i-verify-expired","resource_type":"EC2 instance","monthly_waste_usd":110,"days_idle":90,"suggested_action":"stop"}' \
+	    http://localhost:8082/optimisation | python3 -m json.tool | sed 's/^/    /'
+	@echo "    waiting ~35s for decision timeout..."
+	@sleep 35
+	@meta=$$(curl -sS http://localhost:8082/workflows/opt-optimisation-team-verify-expired-i-verify-expired-stop); \
+	  status=$$(echo "$$meta" | python3 -c 'import sys,json; print(json.load(sys.stdin)["status"])'); \
+	  decision=$$(echo "$$meta" | python3 -c 'import sys,json; print(json.loads(json.load(sys.stdin).get("serializedOutput") or "{}").get("decision",""))'); \
+	  echo "    status=$$status decision=$$decision"; \
+	  [ "$$status" = "1" ] || (echo "  expected status=1"; exit 1); \
+	  [ "$$decision" = "expired" ] || (echo "  expected decision=expired"; exit 1)
+	@echo "  --- Decision records persisted in state-postgres (via /optimisations list):"
+	@curl -sS http://localhost:8082/optimisations | python3 -c 'import sys,json; d=json.load(sys.stdin); [print("    " + o["instance_id"] + "  decision=" + o.get("decision","-")) for o in d["optimisations"] if o["instance_id"].startswith("opt-optimisation-team-verify-")]'
+	@echo "  --- HTMX page renders per-workflow-type buttons (approve+reject on RUNNING optimisation):"
+	@curl -sS -X POST -H 'Content-Type: application/json' \
+	    -d '{"team_id":"team-verify-page","team_name":"Verify Page","service":"ebs","resource_id":"vol-verify-page","resource_type":"EBS volume","monthly_waste_usd":10,"days_idle":15,"suggested_action":"delete"}' \
+	    http://localhost:8082/optimisation > /dev/null
+	@sleep 2
+	@page=$$(curl -sS http://localhost:8082/workflows/opt-optimisation-team-verify-page-vol-verify-page-delete/page); \
+	  echo "$$page" | grep -q 'class="approve"' && echo "    Approve button present" || (echo "  MISSING approve button"; exit 1); \
+	  echo "$$page" | grep -q 'class="reject"' && echo "    Reject button present" || (echo "  MISSING reject button"; exit 1); \
+	  echo "$$page" | grep -q 'Cost optimisation approval' && echo "    Optimisation h1 present" || (echo "  MISSING optimisation h1"; exit 1); \
+	  echo "$$page" | grep -q 'Cost anomaly triage' && (echo "  UNEXPECTED: triage h1 leaked into optimisation page"; exit 1) || echo "    Triage h1 correctly absent"
 
 .PHONY: seed
 seed: ## Post synthetic line items to ingest-svc (COUNT defaults to 100, DAY to today)
