@@ -364,7 +364,7 @@ Scenarios:
 
 ---
 
-## - [ ] T16: Sidecar overhead measurement
+## - [x] T16: Sidecar overhead measurement
 
 **Type**: AFK
 **Blocked by**: T14

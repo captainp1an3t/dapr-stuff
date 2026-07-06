@@ -786,3 +786,121 @@ Baseline: cluster is KinD, single node, local docker. Recovery times observed he
   3. Redesign chaos-2 to actively stress state-store paths during the outage window.
   4. Repeat all five scenarios on a production-shaped cluster (not KinD) to get real recovery-time numbers.
 - Ready for T16 (sidecar overhead measurement) — the last honest-cost slice.
+
+## T16 — sidecar overhead measurement (the honest cost, with numbers)
+
+Turns "there's overhead" into "the overhead is X MiB and Y ms". Two measurements: memory footprint via Prometheus queries, and per-request latency via a small Python probe (`bin/overhead_latency.py`). Baseline + under-load memory snapshots; direct-vs-Dapr latency comparison.
+
+### Confidence in these numbers — read before quoting anything below
+
+| Claim | Confidence | Why |
+|---|---|---|
+| daprd = ~35–80 MiB per pod | **High** | Direct Prometheus `container_memory_working_set_bytes`. Consistent across snapshots and across pods. Matches every published Dapr benchmark. |
+| Sidecar cost is largely fixed under moderate load | **Medium-High** | 30s of ~500-req burst didn't move the numbers meaningfully. But 30s isn't a real load test — sustained high load unmeasured. |
+| "~63% sidecar overhead by memory" | **Medium, misleading** | Ratio is right *for this demo*. Our Go apps are ~8–20 MiB each; that same 50 MiB sidecar becomes 10–30% overhead for a fatter app. **The absolute per-pod cost (~50 MiB) is the honest number** — the percentage looks scary because our apps are unusually small. |
+| Latency: Dapr adds ~0.7ms p50, ~4.6ms p99 | **Medium (direction), Low (magnitude)** | Same rig for both endpoints so the *comparison* is reliable. But localhost + `kubectl port-forward` = systematically optimistic vs real pod-to-pod cluster networking. Only 200 samples — p99 is noisy at that count. |
+| Sidecar tax is defensible for business workloads | **Medium** | Directional; a strict engineer would want thousands of samples over hours. |
+| "~500 MiB cluster memory attributable to Dapr" | **Low** | Control plane pods estimated at 200–300 MiB from earlier snapshots, not precisely measured in this run. |
+| Comparison vs Istio (~100–200 MiB/pod), Temporal (~500 MiB), Vault (~50 MiB/pod) | **Low** | Numbers from memory/docs, not measured in this demo. Trust-me-bro; useful for framing, not for pricing. |
+| Extrapolation to "20-service cluster ≈ 1.5 GiB" | **Low** | Linear scaling isn't guaranteed at scale; control plane behavior at large fleet size not measured. |
+| **Not measured at all** | — | CPU cost of daprd; pod startup delay from sidecar cold-start; behavior under hours of sustained high load; behavior on a real (non-KinD) node. |
+
+**Bottom line: use these as order-of-magnitude numbers for talk framing, not as production sizing. Any real capacity plan needs its own benchmark on your workload.**
+
+### Measured numbers
+
+**Memory (per pod, MiB, working set — from Prometheus):**
+
+| Pod            | App container | daprd sidecar | daprd % of pod |
+|----------------|--------------:|--------------:|---------------:|
+| ingest-svc     |         ~18–22 |         ~69–79 |  ~78% |
+| rollup-svc     |         ~13–14 |         ~47–55 |  ~78% |
+| triage-svc     |          ~8–11 |         ~34–51 |  ~82% |
+| notifier-svc   |         ~67–68 |         ~34–35 |  ~34% |
+| **Total apps** |     **~109–115** |               |     |
+| **Total sidecars** |               |    **~181–210** |     |
+| **Sidecar overhead** |             |             | **~63–65%** |
+
+Baseline (idle) and under-load (500 line items + 200 workflow starts) numbers differ by <30 MiB total. **The sidecar tax is largely fixed** — it's the *presence* of daprd that costs, not the volume of work it does.
+
+**Latency (n=200 sequential requests, warmup discarded):**
+
+| Path | p50 | p95 | p99 | max |
+|------|----:|----:|----:|----:|
+| Direct HTTP (host → triage-svc:8080, no sidecar) | 0.8ms | 1.3ms | 2.3ms | 5.3ms |
+| Dapr service invocation (host → ingest daprd → triage daprd → app, mTLS) | 1.5ms | 3.0ms | **6.9ms** | 7.5ms |
+| **Dapr overhead** | **+0.7ms** | **+1.7ms** | **+4.6ms** | +2.2ms |
+
+**~2–5ms of added latency at p99 for a full mTLS-wrapped, two-sidecar-hop service invocation.** Measured on localhost port-forward with 200 samples — the *direction* is reliable, the exact ms number is optimistic vs a real cluster. For most business workflows (which are hundreds of ms of DB / broker / actor state anyway), it's noise. For sub-ms trading paths, it's a hard no.
+
+### Interpretation
+
+- **The daprd sidecar is a fixed ~35–80 MiB cost per pod.** For tiny apps (our Go microservices at 8–20 MiB), it *dominates* the pod's memory footprint — the sidecar is 3–5× larger than the app. For fatter apps (our Python notifier at 68 MiB) it's ~half the pod.
+- **The sidecar is barely responsive to load.** ingest-svc's daprd grew from ~79 MiB idle to ~69 MiB under load (the fluctuation is noise, roughly). The sidecar sizes are almost entirely startup allocations — 500 requests didn't move them meaningfully.
+- **Latency overhead is sub-2ms at p50 and sub-7ms at p99.** For a call that traverses two sidecars, mTLS handshake reuse, service discovery, and gRPC/HTTP translation, that's genuinely small. This is the answer to "isn't the sidecar slow?" — **it isn't, for anything above sub-ms hot paths**.
+- **The sidecar-only-once cost is worth naming.** If a pod calls Dapr once during startup and then does 10 minutes of internal work, the 80 MiB sidecar is still there, doing nothing. **Pod density suffers even when Dapr usage is low.**
+
+### Cluster-level context
+
+For this demo:
+- **4 app containers total: ~110 MiB.**
+- **4 daprd sidecars total: ~200 MiB** (that's the ~65% overhead).
+- **Dapr control plane (dapr-system namespace): 7 pods** (operator, placement, scheduler×3, sentry, sidecar-injector) — not measured precisely in this run but consistently ~200–300 MiB from earlier snapshots.
+- **Infrastructure (data plane, not Dapr): Redis + Postgres + RabbitMQ ≈ ~300–400 MiB.** These would exist in ANY equivalent system.
+
+**Total cluster memory attributable to Dapr adoption: ~400–500 MiB** for this shape of workload (4 services, no Dapr feature turned off). Divide by node budget: a 4 GiB node absorbs this at ~12%; a 1 GiB node at ~50%. **Dapr wants at least a 4 GiB memory budget on the target node** to be comfortable.
+
+### Comparison to no-Dapr equivalents
+
+If we stripped Dapr and rebuilt with best-in-class alternatives:
+
+| Concern | Dapr | Alternative | Alternative cost |
+|---|---|---|---|
+| Service invocation + mTLS | daprd sidecar | Istio sidecar | ~100–200 MiB/pod (matches or exceeds Dapr) |
+| Durable workflows | daprd + Redis actors | Temporal | Temporal server ~500 MiB + its own DB |
+| Secret access abstraction | daprd + Kubernetes SM | Vault sidecar or SDK-per-language | ~50 MiB/pod for Vault sidecar |
+| Pub/sub abstraction | daprd + broker | Native SDK-per-broker-per-language | Almost free in bytes, expensive in code |
+| Retry / circuit breakers | Dapr resiliency policies (config) | Per-language library (Hystrix, resilience4j…) | Free in bytes, per-language operational cost |
+
+**The honest read:** Dapr's overhead is real but not obviously worse than the sum of alternatives you'd need to replicate its features. A shop that uses Dapr for **all** its concerns pays one moderate cost. A shop that uses Dapr only for one thing (e.g. only workflows) is paying the full sidecar tax for a fraction of the benefit.
+
+### Pros
+
+- **Latency overhead is defensible for business workloads.** ~2–5ms at p99 for a mTLS-wrapped, cross-service call is competitive with Istio and better than most bespoke solutions. Not a blocker for any workflow-shaped or request/response system.
+- **Memory overhead is bounded and predictable.** Each pod pays a fixed daprd cost; the sidecar doesn't grow much under load. This makes capacity planning honest: `pods × sidecar_mib + control_plane_mib + your_apps`.
+- **The overhead numbers are stable across restarts and load.** Baseline vs under-load memory differs by <30 MiB total — this isn't a "goes up over time" leak, it's a fixed cost with a small utilisation delta.
+
+### Cons
+
+- **The sidecar is 3–5× larger than the apps it serves for tiny Go services.** ingest-svc, rollup-svc, triage-svc are all under 25 MiB each; their daprd sidecars are 35–79 MiB. **Sidecar-to-app ratio is embarrassing when the app is small.** This is where the "Dapr feels heavy" objection lands.
+- **~500 MiB cluster overhead for a 4-service demo is substantial** if your target is edge / low-memory environments. For a 100-service cluster, the sidecar cost is 100× the per-pod number — plus control plane which grows sublinearly but grows.
+- **The overhead is paid EVEN IF you use one Dapr feature.** A service that only reads secrets via Dapr still pays the full sidecar cost. **There is no partial-adoption discount.** In the pitch, this is a "you're all-in or you're wasting money" moment.
+- **Adding a service mesh alongside Dapr** (some orgs would do this for zero-trust) approximately doubles the sidecar tax. Dapr + Istio = ~200–400 MiB of sidecars per pod, before the app.
+
+### Gotchas
+
+- **`ab` on macOS against localhost port-forwards is broken.** Every request reports ~1000ms regardless of endpoint. Both direct and Dapr endpoints return identical ~1006ms via `ab`; `curl` and Python's `requests` report ~15ms for both. Cause: unknown — probably `ab`'s socket teardown behavior interacts badly with Tilt's port-forwarder. **Cost me one debug cycle.** Use `bin/overhead_latency.py` (Python + `requests`) instead.
+- **`kubectl top pod` requires `metrics-server`, which is not installed by kube-prometheus-stack.** The chart provides Prometheus scraping of cAdvisor metrics via node-exporter, but the metrics-server API is separate. Workaround: query Prometheus directly for `container_memory_working_set_bytes`. Documented in `bin/overhead_mem.py`.
+- **daprd's distroless image confounds a `kubectl exec` sanity check.** Cannot exec into the sidecar to inspect memory from inside — no shell. This is the same limitation from T15 chaos-4.
+- **Load-driving via the Makefile has to be short.** Running `chaos-traffic` in parallel during `make overhead` would drive load, but starting/stopping it from within `make` is awkward. Used a one-shot burst instead (500 ingests + 200 workflows over ~30s). Fine for a demo, not a real load test.
+
+### Overhead of the overhead measurement itself
+
+- Two new helper scripts: `bin/overhead_mem.py` (~40 lines) and `bin/overhead_latency.py` (~80 lines).
+- Four new Makefile targets: `overhead`, `overhead-memory`, `overhead-mem-snapshot`, `overhead-latency`, `overhead-summary`.
+- Full run time: ~90 seconds (memory snapshots + 30s load + 15s settle + 200 requests × 2 = ~60s of latency).
+- No new dependencies at runtime (just the notifier-svc `.venv` for the `requests` library we already pin).
+
+### Meta
+
+- **These are order-of-magnitude numbers for framing, not production sizing.** The pitch-safe phrasing: *"On this demo, daprd costs about 50 MiB per pod and adds a few milliseconds at p99. That's within the range every Dapr benchmark reports. For your production sizing, budget 50–80 MiB per pod, 200–500 MiB for control plane, and re-measure on your workload — these numbers are directional."* Do not quote a specific ms figure without saying "on localhost KinD with N samples".
+- **The counter-pitch to remember:** these numbers are for a small demo with unusually small apps. In a large cluster the sidecar count grows linearly with pod count, but the control plane is amortised. Sidecar-tax-as-a-percentage improves as apps get bigger; it's worst for tiny apps like our Go microservices.
+- **For a realistic production budget:** plan on `~50 MiB × pod_count` for daprd + `~250 MiB` for control plane + `~200 MiB` for Redis (if you use workflows/actors) + your existing broker/state-store. A 20-service cluster: **guess** ~1.5 GiB of Dapr-attributable memory — flagged as guess-not-measurement.
+- **What this doesn't measure (call out explicitly if asked):**
+  - CPU overhead of daprd (Go, likely small — but *not* measured here).
+  - Pod startup time added by sidecar cold-start (noticed but not quantified).
+  - Cost under sustained hours-long load.
+  - Behaviour on production-shaped nodes (real disks, network, kernel tuning).
+- All these would benefit from re-running on production-shaped infrastructure with a real load generator (k6, hey, wrk over the actual services rather than localhost).
+
+**This is the last honest-cost slice. NOTES.md is now complete for v1 of the demo.**

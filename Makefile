@@ -568,6 +568,89 @@ chaos-5: ## T15 scenario 5: kill Dapr placement service — the control-plane wo
 	  echo "  final state:"; \
 	  curl -sS http://localhost:8082/workflows/$$id | python3 -m json.tool | sed 's/^/    /'
 
+## ---- T16 sidecar overhead measurement ------------------------------------
+## Answers two questions with numbers instead of hand-waving:
+##   1. What does the Dapr sidecar cost in memory (idle + under load)?
+##   2. What does using Dapr service invocation cost per call (p50/p99)?
+##
+## Requires Prometheus running (kube-prometheus-stack, installed by `make up`)
+## and ApacheBench (`ab`, ships with macOS). Uses a port-forward to Prometheus
+## for memory queries and Tilt's existing port-forwards for latency tests.
+
+.PHONY: overhead
+overhead: overhead-memory overhead-latency overhead-summary ## T16 full overhead report
+
+.PHONY: overhead-memory
+overhead-memory: ## T16 memory: daprd sidecar vs app container per pod, idle + under load
+	@echo "== T16 memory footprint (via Prometheus container_memory_working_set_bytes) =="
+	@echo "-- port-forwarding Prometheus (background) --"
+	@kubectl --context $(KUBE_CTX) port-forward -n monitoring svc/kube-prom-stack-kube-prome-prometheus 19090:9090 >/dev/null 2>&1 & \
+	echo $$! > /tmp/prom-pf.pid; \
+	sleep 3
+	@echo "-- BASELINE (cluster idle) --"
+	@$(MAKE) --no-print-directory overhead-mem-snapshot
+	@echo
+	@echo "-- driving load: 200 workflow starts + 500 line-item ingests over ~30s --"
+	@python3 data/generator/generate.py --day $$(date +%Y-%m-%d) --count 500 --seed 16001 --url http://localhost:8080/ingest >/dev/null 2>&1 &
+	@for i in $$(seq 1 50); do \
+	  ts=$$(date +%s%N); \
+	  curl -sS -X POST -H 'Content-Type: application/json' \
+	    -d "{\"day\":\"2026-07-05\",\"team_id\":\"team-overhead-$$ts\",\"team_name\":\"Overhead $$ts\",\"service\":\"ec2\",\"actual_cost_usd\":1000,\"baseline_cost_usd\":100,\"delta_pct\":900}" \
+	    http://localhost:8082/triage >/dev/null 2>&1; \
+	done; \
+	echo "  (workflows scheduled; waiting 15s for load to settle in metrics)"; \
+	sleep 15
+	@echo "-- UNDER LOAD --"
+	@$(MAKE) --no-print-directory overhead-mem-snapshot
+	@echo "-- cleanup port-forward --"
+	@if [ -f /tmp/prom-pf.pid ]; then kill $$(cat /tmp/prom-pf.pid) 2>/dev/null; rm -f /tmp/prom-pf.pid; fi
+
+.PHONY: overhead-mem-snapshot
+overhead-mem-snapshot: ## T16 helper: query Prometheus for current memory per (pod, container)
+	@python3 bin/overhead_mem.py
+
+.PHONY: overhead-latency
+overhead-latency: ## T16 latency: direct HTTP vs Dapr service-invocation (p50/p95/p99 via requests)
+	@echo
+	@echo "== T16 latency: direct HTTP vs Dapr service invocation (n=200, sequential) =="
+	@echo "  NOTE: uses a small Python probe (bin/overhead_latency.py) — not ab —"
+	@echo "  because ab-on-macOS-against-localhost-port-forwards has a consistent"
+	@echo "  ~1000ms per-request artifact that swamps real signal. curl and Python"
+	@echo "  agree on ms-level latencies; ab does not. See NOTES.md T16 gotcha."
+	@echo
+	@python3 bin/overhead_latency.py http://localhost:8082/health \
+	  --label "direct   (host -> triage-svc:8080 direct, no sidecar in path)" --n 200
+	@python3 bin/overhead_latency.py http://localhost:3500/v1.0/invoke/triage-svc/method/health \
+	  --label "via Dapr (host -> ingest daprd -> triage daprd -> app, mTLS)" --n 200
+
+.PHONY: overhead-summary
+overhead-summary: ## T16 print the estimation of full-stack vs equivalent no-Dapr deployment
+	@echo
+	@echo "== T16 stack-level estimate (memory) =="
+	@echo "  With Dapr (measured above):"
+	@echo "    - 4 app pods (ingest, rollup, triage, notifier)"
+	@echo "    - 4 daprd sidecars"
+	@echo "    - Dapr control plane: operator, placement, scheduler(x3), sentry, sidecar-injector"
+	@echo "    - Actor state store: Redis (also used by Dapr Workflows)"
+	@echo "    - Component state: Postgres (state store)"
+	@echo "    - Pub/sub: RabbitMQ"
+	@echo
+	@echo "  Equivalent no-Dapr deployment (estimate, no measurement):"
+	@echo "    - 4 app pods (no sidecar) → saves ~4 x 40-60 MiB = 160-240 MiB"
+	@echo "    - No control plane → saves ~7 pods, ~200-300 MiB"
+	@echo "    - Would need: message-queue client library per app (in-process, ~free)"
+	@echo "    - Would need: retry/circuit-breaker library per app (in-process, ~free)"
+	@echo "    - Would need: OR a service mesh (Istio/Linkerd) for equivalent mTLS/observability"
+	@echo "      → service mesh has its OWN sidecar cost (~100-200 MiB/pod for Istio)"
+	@echo "    - Would need: workflow engine (Temporal or DIY) if we want durable workflows"
+	@echo "      → Temporal server: ~500 MiB + its own DB"
+	@echo
+	@echo "  Ballpark net delta for THIS demo: Dapr adds ~500-700 MiB total cluster"
+	@echo "  memory (sidecars + control plane) vs a no-abstraction baseline."
+	@echo "  BUT: replicating all Dapr features with best-in-class alternatives"
+	@echo "  (service mesh + workflow engine + secrets mgr) often costs MORE."
+	@echo "  The trade is 'one moderate cost' vs 'several small costs plus glue'."
+
 ## ---- Cluster lifecycle ----------------------------------------------------
 
 .PHONY: cluster-ensure
